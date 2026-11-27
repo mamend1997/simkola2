@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node railway-start.js",
     "test": "node dev-tests/hardening.js",
-    "test:hardening": "node dev-tests/hardening.js"
+    "test:hardening": "node dev-tests/hardening.js",
+    "test:mysql-runtime": "node dev-tests/mysql-runtime.js",
+    "check:mysql": "node mysql-check.js"
   },
   "engines": {
     "node": "22.x"

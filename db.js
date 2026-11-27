@@ -4,6 +4,13 @@ const fs = require('fs');
 const crypto = require('crypto');
 // muat konfigurasi .env sebelum apa pun membaca process.env (DB_PATH, dsb.)
 require('./env');
+const DB_DRIVER = String(process.env.DB_DRIVER || 'sqlite').trim().toLowerCase();
+if (DB_DRIVER !== 'sqlite') {
+  if (DB_DRIVER === 'mysql') {
+    throw new Error('DB_DRIVER=mysql diminta, tetapi runtime aplikasi belum dipindahkan sepenuhnya ke MySQL. Startup dihentikan agar tidak diam-diam memakai SQLite.');
+  }
+  throw new Error(`DB_DRIVER "${DB_DRIVER}" tidak didukung. Runtime yang tersedia saat ini: sqlite.`);
+}
 const Database = require('better-sqlite3');
 const { AsyncLocalStorage } = require('async_hooks');
 const { hashPassword, nowStamp, todayISO, parseMoney } = require('./lib');
