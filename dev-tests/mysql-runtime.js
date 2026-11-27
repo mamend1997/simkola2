@@ -30,7 +30,18 @@ assert.throws(() => readConfig({ ...baseEnv, MYSQL_TENANT_DATABASES: '{"0":"scho
 const mysqlStartup = spawnSync(process.execPath, ['-e', `
   const assert = require('node:assert/strict');
   const mysqlDb = require('./db');
+  const saas = require('./saas');
   assert.equal(mysqlDb.DB_DRIVER, 'mysql');
+  assert.equal(saas.DB_DRIVER, 'mysql');
+  assert.equal(typeof saas.initialize, 'function');
+  assert.equal(typeof saas.authenticateSchool, 'function');
+  assert.equal(typeof saas.getSession, 'function');
+  assert.equal(typeof saas.mfaVerify, 'function');
+  assert.equal(typeof saas.packageRows, 'function');
+  assert.equal(typeof saas.regStatus, 'function');
+  assert.equal(typeof saas.otpDaftarSend, 'function');
+  assert.equal(typeof saas.otpDaftarVerify, 'function');
+  assert.equal(typeof saas.createTenant, 'function');
   assert.equal(typeof mysqlDb.mysqlRuntime.schoolPool, 'function');
   assert.equal(typeof mysqlDb.withTenant, 'function');
   assert.equal(typeof mysqlDb.withControl, 'function');
@@ -59,6 +70,67 @@ const mysqlStartup = spawnSync(process.execPath, ['-e', `
 });
 assert.equal(mysqlStartup.status, 0, mysqlStartup.stderr || mysqlStartup.error?.message);
 assert.match(mysqlStartup.stdout, /MYSQL_DB_API_READY/);
+
+const mysqlSaasStartup = spawnSync(process.execPath, ['-e', `
+  const assert = require('node:assert/strict');
+  const { createMysqlSaas } = require('./mysql-saas');
+  const statements = [];
+  const database = {
+    withControl: fn => fn(),
+    async query(sql) { statements.push(sql); return { affectedRows: 0 }; },
+    prepare(sql) {
+      return {
+        all: async () => {
+          if (/SELECT k,v FROM saas_settings/.test(sql)) return [];
+          return [];
+        },
+        get: async () => null,
+        run: async () => ({ changes: 1, lastInsertRowid: 0 })
+      };
+    },
+    async transaction(fn) { return fn({ prepare: this.prepare.bind(this) }); }
+  };
+  const authStore = {
+    tenantById: async id => ({ id }),
+    tenantByCode: async code => ({ id: 1, school_code: code })
+  };
+  (async () => {
+    const saas = createMysqlSaas({ database, authStore });
+    await assert.rejects(saas.set('saas_nama', 'Sebelum init'), /belum diinisialisasi/);
+    await saas.initialize();
+    assert.equal(saas.isInitialized(), true);
+    assert.equal(saas.appName(), 'SIMKOLA');
+    assert.equal(saas.daftarOtpCfg().aktif, true);
+    assert.equal(saas.packageSelfTrial({ self_trial: 1 }), true);
+    assert.equal(saas.packageTrialDays({ trial_hari: null }), 7);
+    assert.equal(saas.packageFeatureMap({ kode: 'basic', fitur: '["siswa"]' }).siswa, 1);
+    assert.equal(saas.packageFeatureMap({ kode: 'basic', fitur: '["siswa"]' }).payroll, 0);
+    await saas.set('saas_nama', 'SIMKOLA Uji');
+    assert.equal(saas.appName(), 'SIMKOLA Uji');
+    assert.deepEqual(await saas.tenantById(3), { id: 3 });
+    assert.ok(statements.some(sql => /CREATE TABLE IF NOT EXISTS sessions/.test(sql)));
+    assert.ok(statements.some(sql => /CREATE TABLE IF NOT EXISTS auth_attempts/.test(sql)));
+    assert.ok(statements.some(sql => /CREATE TABLE IF NOT EXISTS saas_packages/.test(sql)));
+    assert.ok(statements.some(sql => /CREATE TABLE IF NOT EXISTS reg_attempts/.test(sql)));
+    assert.ok(statements.some(sql => /CREATE TABLE IF NOT EXISTS daftar_otp/.test(sql)));
+    console.log('MYSQL_SAAS_API_READY');
+  })().catch(error => { console.error(error); process.exitCode = 1; });
+`], {
+  cwd: path.join(__dirname, '..'),
+  env: {
+    ...process.env,
+    DB_DRIVER: 'mysql',
+    MYSQL_HOST: 'localhost',
+    MYSQL_PORT: '3306',
+    MYSQL_USER: 'test',
+    MYSQL_PASSWORD: 'test-only',
+    MYSQL_TENANT_DB: 'school_db',
+    MYSQL_CONTROL_DB: 'control_db'
+  },
+  encoding: 'utf8'
+});
+assert.equal(mysqlSaasStartup.status, 0, mysqlSaasStartup.stderr || mysqlSaasStartup.error?.message);
+assert.match(mysqlSaasStartup.stdout, /MYSQL_SAAS_API_READY/);
 
 const mysqlDdl = mysqlSchemaStatements(appSchema);
 assert.ok(mysqlDdl.length > 0);
@@ -221,6 +293,7 @@ async function main() {
   const authStore = createMysqlAuthStore(database);
   assert.equal(runtime.config.tenantDatabase, 'school_db');
   assert.equal(runtime.config.controlDatabase, 'control_db');
+  assert.equal(runtime.schoolDatabaseName(1), 'school_db');
 
   const school = runtime.schoolPool(1);
   assert.strictEqual(school, runtime.schoolPool(1));
@@ -257,6 +330,7 @@ async function main() {
     mysql: { createPool: fakePool }
   });
   const tenantTwoPool = mappedRuntime.schoolPool(2);
+  assert.equal(mappedRuntime.schoolDatabaseName(2), 'school_two_db');
   assert.notStrictEqual(tenantTwoPool, mappedRuntime.schoolPool(1));
   assert.equal((await mappedRuntime.query(tenantTwoPool, 'SELECT DATABASE() AS database_name'))[0].database_name, 'school_two_db');
   assert.throws(() => mappedRuntime.schoolPool(3), /belum dikonfigurasi/);

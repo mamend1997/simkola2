@@ -86,7 +86,7 @@ function createMysqlRuntime({ env = process.env, mysql = mysqlDefault } = {}) {
     return pool;
   }
 
-  function schoolPool(tenantId = 1, mysqlDatabase) {
+  function schoolDatabaseName(tenantId = 1, mysqlDatabase) {
     const id = Number(tenantId);
     if (!Number.isInteger(id) || id < 1) throw new Error('ID sekolah MySQL tidak valid.');
     const mappedDatabase = config.tenantDatabases[String(id)];
@@ -96,7 +96,11 @@ function createMysqlRuntime({ env = process.env, mysql = mysqlDefault } = {}) {
     if (mappedDatabase && mysqlDatabase && mappedDatabase !== mysqlDatabase) {
       throw new Error(`Database MySQL tenant ${id} tidak cocok dengan pemetaan yang dikonfigurasi.`);
     }
-    return poolFor(database);
+    return database;
+  }
+
+  function schoolPool(tenantId = 1, mysqlDatabase) {
+    return poolFor(schoolDatabaseName(tenantId, mysqlDatabase));
   }
 
   async function query(pool, sql, values = []) {
@@ -166,10 +170,12 @@ function createMysqlRuntime({ env = process.env, mysql = mysqlDefault } = {}) {
       host: config.host,
       port: config.port,
       tenantDatabase: config.tenantDatabase,
+      tenantDatabases: Object.freeze({ ...config.tenantDatabases }),
       controlDatabase: config.controlDatabase,
       connectionLimit: config.connectionLimit
     }),
     controlPool: () => poolFor(config.controlDatabase),
+    schoolDatabaseName,
     schoolPool,
     query,
     checkConnections,

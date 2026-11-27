@@ -2,6 +2,14 @@
 
 module.exports = ({ get, post, dbm, lib, ui, page, ctx, guard, can, setSession, COOKIE, roleLabel, permissionMatrix, renderError, uploadMedia, saas }) => {
   const { db } = dbm;
+  const JENJANG = dbm.JENJANG || {
+    'PAUD/TK': { label: 'PAUD/TK', preset: ['KB', 'TK-A', 'TK-B'] },
+    'SD/MI': { label: 'SD/MI', preset: ['I', 'II', 'III', 'IV', 'V', 'VI'] },
+    'SMP/MTs': { label: 'SMP/MTs', preset: ['VII', 'VIII', 'IX'] },
+    'SMA/MA': { label: 'SMA/MA', preset: ['X', 'XI', 'XII'] },
+    'SMK': { label: 'SMK', preset: ['X', 'XI', 'XII'] },
+    'KUSTOM': { label: 'Kustom', preset: [] }
+  };
   const secureCookie = req => String(req.headers['x-forwarded-proto'] || (req.socket && req.socket.encrypted ? 'https' : ''))
     .split(',')[0].trim().toLowerCase() === 'https' ? '; Secure' : '';
 
@@ -94,6 +102,41 @@ ${ui.themeCss(tema)}
     const password = String(req.body.password || '');
     const fail = msg => res.redirect(base + '/login?err=' + encodeURIComponent(msg) + (kode ? '&kode=' + encodeURIComponent(kode) : ''));
     const identity = 'school:' + ident.toLowerCase();
+    if (dbm.DB_DRIVER === 'mysql') {
+      try {
+        const result = await saas.authenticateSchool({ schoolCode: kode, identity: ident, password });
+        if (!result.ok) {
+          if (result.reason === 'rate_limited') return fail('Terlalu banyak percobaan masuk. Silakan coba kembali dalam 15 menit.');
+          if (result.reason === 'tenant_not_found') return fail('Kode sekolah "' + kode + '" tidak ditemukan. Periksa kembali kode dari admin sekolah Anda.');
+          if (result.reason === 'tenant_missing') return fail('Kode sekolah wajib diisi (4 karakter).');
+          if (result.reason === 'account_disabled') return fail('Akun Anda dinonaktifkan. Hubungi admin sekolah.');
+          return fail('Username atau password salah' + (kode ? ' untuk sekolah ' + kode : '') + '.');
+        }
+
+        const pending = await dbm.withTenant(result.tenant, () => db.prepare(
+          "SELECT COUNT(*) AS c FROM transaksi WHERE status='pending'"
+        ).get());
+        await saas.updateSession(result.token, { alert_pending: Number(pending && pending.c) || 0 });
+        try {
+          await dbm.withTenant(result.tenant, () => dbm.mysqlHelpers.logAudit(
+            result.user, 'LOGIN', 'auth', `${result.user.nama} masuk ke aplikasi (${result.tenant.nama})`
+          ));
+        } catch (error) {
+          console.error('[login-audit]', error.message);
+        }
+        res.set('Set-Cookie', `${COOKIE}=${result.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 14}${secureCookie(req)}`);
+        return res.redirect(base + '/');
+      } catch (error) {
+        console.error('[login-mysql]', error.message);
+        return res.html(authShell({
+          base,
+          sideTitle: 'Kelola keuangan sekolah dengan rapi, aman, dan transparan.',
+          sideDesc: 'Satu tempat untuk transaksi harian, anggaran, piutang, sampai pelaporan pertanggungjawaban dana sekolah.',
+          content: `<div class="alert err">${ui.icon('alert')}<div>Login gagal karena layanan database sedang bermasalah. Silakan coba lagi atau hubungi administrator.</div></div>
+            <a class="btn btn-primary btn-block" href="${base}/login">Kembali ke Login</a>`
+        }), 503);
+      }
+    }
     if (await saas.authIsLimited(identity)) return fail('Terlalu banyak percobaan masuk. Silakan coba kembali dalam 15 menit.');
     // Kompatibilitas: tautan/ bookmark lama tanpa kode sekolah tetap dilayani
     // oleh sekolah pertama (SK01). Bila kode diisi, isolasi tetap ketat per sekolah.
@@ -126,38 +169,41 @@ ${ui.themeCss(tema)}
   });
 
   /* ---------------- PENDAFTARAN MANDIRI SEKOLAH BARU ---------------- */
-  function trialPackage() {
-    const packages = saas.packageRows();
+  async function trialPackage() {
+    const packages = await saas.packageRows();
     const available = packages.filter(p => saas.packageSelfTrial(p) && saas.packageTrialDays(p) > 0);
-    const preferred = saas.defaultPackage();
-    return available.find(p => p.kode === preferred.kode) || available[0] || null;
+    const preferred = await saas.defaultPackage();
+    return available.find(p => preferred && p.kode === preferred.kode) || available[0] || null;
   }
 
-  function phoneAlreadyRegistered(raw) {
+  async function phoneAlreadyRegistered(raw) {
     const phone = lib.normPhone(raw);
     if (!phone) return false;
-    return saas.allTenants().some(t => {
+    if (dbm.DB_DRIVER === 'mysql') return saas.phoneAlreadyRegistered(raw);
+    const tenants = await saas.allTenants();
+    for (const t of tenants) {
       if (lib.normPhone(t.contact_telp) === phone) return true;
       const conn = dbm.openTenantConn(t.id, t.db_file);
       const schoolPhone = conn.prepare("SELECT v FROM settings WHERE k='sekolah_telp'").get();
-      return lib.normPhone(schoolPhone && schoolPhone.v) === phone;
-    });
+      if (lib.normPhone(schoolPhone && schoolPhone.v) === phone) return true;
+    }
+    return false;
   }
 
-  function registerForm(req, res, { err } = {}) {
+  async function registerForm(req, res, { err } = {}) {
     const base = req.BASE;
     const q = req.query;
     const v = k => lib.esc(q.get(k) || '');
     /* ---- verifikasi nomor WhatsApp (OTP 4 digit) ---- */
-    const otpCfg = (() => { try { return saas.daftarOtpCfg(); } catch (e) { return { aktif: false, menit: 10 }; } })();
+    const otpCfg = await saas.daftarOtpCfg();
     const otpTokenQ = String(q.get('otp') || '').trim();
     const otpCheck = otpCfg.aktif && otpTokenQ
-      ? (() => { try { return saas.otpDaftarValid(otpTokenQ, q.get('telp')); } catch (e) { return { ok: false }; } })()
+      ? await saas.otpDaftarValid(otpTokenQ, q.get('telp'))
       : { ok: false };
     const otpVerified = !!otpCheck.ok;
     const otpToken = otpVerified ? otpTokenQ : '';
-    const trialPkg = trialPackage();
-    const cap = saas.captchaConfig();
+    const trialPkg = await trialPackage();
+    const cap = await saas.captchaConfig();
     const capSite = cap.siteKey;
     let captchaHtml = '';
     if (cap.provider === 'turnstile' && capSite) {
@@ -195,7 +241,7 @@ ${ui.themeCss(tema)}
         <div class="field"><label>Nama Sekolah</label><input type="text" name="nama" value="${v('nama')}" required placeholder="SMK Negeri 1 Contoh"></div>
         <div class="field"><label>Jenjang Pendidikan</label>
           <select name="jenjang">
-            ${Object.entries(dbm.JENJANG).map(([k, val]) => `<option value="${lib.esc(k)}" ${v('jenjang') === lib.esc(k) ? 'selected' : ''}>${lib.esc(val.label)}${val.preset.length ? ' — tingkat ' + val.preset.join(', ') : ''}</option>`).join('')}
+            ${Object.entries(JENJANG).map(([k, val]) => `<option value="${lib.esc(k)}" ${v('jenjang') === lib.esc(k) ? 'selected' : ''}>${lib.esc(val.label)}${val.preset.length ? ' — tingkat ' + val.preset.join(', ') : ''}</option>`).join('')}
           </select>
         </div>
         <div class="field"><label>Alamat Sekolah</label><input type="text" name="alamat" value="${v('alamat')}" required placeholder="Jl. Pendidikan No. 1, Kota"></div>
@@ -398,8 +444,8 @@ ${ui.themeCss(tema)}
     }));
   }
 
-  get('/register', (req, res) => registerForm(req, res));
-  get('/daftar', (req, res) => registerForm(req, res));
+  get('/register', async (req, res) => registerForm(req, res));
+  get('/daftar', async (req, res) => registerForm(req, res));
 
   /* ================================================================
      VERIFIKASI NOMOR WHATSAPP PENDAFTAR (OTP 4 DIGIT)
@@ -408,14 +454,14 @@ ${ui.themeCss(tema)}
      ================================================================ */
   post('/register/otp/kirim', async (req, res) => {
     const b = req.body || {};
-    const cfg = (() => { try { return saas.daftarOtpCfg(); } catch (e) { return { aktif: false }; } })();
+    const cfg = await saas.daftarOtpCfg();
     if (!cfg.aktif) return res.json({ ok: false, err: 'Verifikasi OTP sedang dinonaktifkan oleh administrator.' }, 400);
     try {
       const telp = String(b.telp || '').trim();
       if (!/^\+?\d{8,17}$/.test(telp)) {
         return res.json({ ok: false, err: 'Nomor WhatsApp tidak valid. Gunakan angka dengan awalan +62.' }, 400);
       }
-      if (phoneAlreadyRegistered(telp)) {
+      if (await phoneAlreadyRegistered(telp)) {
         return res.json({ ok: false, err: 'Nomor WhatsApp ini sudah dipakai untuk sekolah lain. Gunakan nomor yang belum terdaftar.' }, 409);
       }
       const r = await saas.otpDaftarSend(telp, saas.clientIpOf(req));
@@ -438,10 +484,10 @@ ${ui.themeCss(tema)}
     }
   });
 
-  post('/register/otp/verifikasi', (req, res) => {
+  post('/register/otp/verifikasi', async (req, res) => {
     const b = req.body || {};
     try {
-      const r = saas.otpDaftarVerify(String(b.token || '').trim(), String(b.kode || '').trim());
+      const r = await saas.otpDaftarVerify(String(b.token || '').trim(), String(b.kode || '').trim());
       if (!r.ok) return res.json({ ok: false, err: r.err }, 400);
       return res.json({ ok: true, phone: lib.phoneDisplay(r.row.phone) });
     } catch (e) {
@@ -467,7 +513,7 @@ ${ui.themeCss(tema)}
     const ip = saas.clientIpOf(req);
 
     // ---- 1) RATE LIMIT / IP THROTTLING (maks. N pendaftaran per jam, blokir X jam) ----
-    const status = saas.regStatus(ip);
+    const status = await saas.regStatus(ip);
     if (status.blocked) {
       return res.redirect(back(Object.assign({}, keep, {
         err: `Terlalu banyak permintaan pendaftaran. Silakan coba beberapa saat lagi (${status.retryMin} menit).`
@@ -477,12 +523,15 @@ ${ui.themeCss(tema)}
     // ---- 2) CAPTCHA (reCAPTCHA v3 / Turnstile) bila dikonfigurasi ----
     const capErr = await saas.verifyCaptcha(b.cfTurnstileResponse || b['cf-turnstile-response'] || b.recaptcha_token, ip);
     if (capErr) {
-      saas.regLog(ip, email, 'captcha');
+      await saas.regLog(ip, email, 'captcha');
       return res.redirect(back(Object.assign({}, keep, { err: capErr })));
     }
 
     // ---- 3) validasi isian ----
-    const fail = msg => { saas.regLog(ip, email, 'gagal'); return res.redirect(back(Object.assign({}, keep, { err: msg }))); };
+    const fail = async msg => {
+      await saas.regLog(ip, email, 'gagal');
+      return res.redirect(back(Object.assign({}, keep, { err: msg })));
+    };
     if (!nama) return fail('Nama sekolah wajib diisi.');
     if (!alamat) return fail('Alamat sekolah wajib diisi.');
     if (!adminNama) return fail('Nama admin wajib diisi.');
@@ -490,36 +539,36 @@ ${ui.themeCss(tema)}
     if (String(b.telp || '').trim() && (!/^\+?\d{8,17}$/.test(String(b.telp).trim()) || !lib.normPhone(b.telp))) {
       return fail('Nomor WhatsApp hanya boleh berisi angka dan harus valid.');
     }
-    if (phoneAlreadyRegistered(b.telp)) return fail('Nomor WhatsApp ini sudah dipakai untuk sekolah lain. Gunakan nomor yang belum terdaftar.');
+    if (await phoneAlreadyRegistered(b.telp)) return fail('Nomor WhatsApp ini sudah dipakai untuk sekolah lain. Gunakan nomor yang belum terdaftar.');
     if (p1.length < 8 || !/[A-Z]/.test(p1) || !/[0-9]/.test(p1) || !/[^A-Za-z0-9]/.test(p1)) {
       return fail('Password minimal 8 karakter dan wajib memuat huruf besar, angka, serta simbol.');
     }
-    const jenjang = dbm.JENJANG[String(b.jenjang || '')] ? String(b.jenjang) : '';
+    const jenjang = JENJANG[String(b.jenjang || '')] ? String(b.jenjang) : '';
 
     /* ---- verifikasi nomor WhatsApp (OTP 4 digit) WAJIB sebelum submit ---- */
-    const otpCfg = (() => { try { return saas.daftarOtpCfg(); } catch (e) { return { aktif: false }; } })();
+    const otpCfg = await saas.daftarOtpCfg();
     if (otpCfg.aktif) {
       if (!String(b.telp || '').trim()) return fail('Nomor WhatsApp wajib diisi & diverifikasi dengan kode OTP.');
-      const otp = (() => { try { return saas.otpDaftarValid(String(b.otp_token || '').trim(), b.telp); } catch (e) { return { ok: false, err: 'Verifikasi OTP gagal diproses.' }; } })();
+      const otp = await saas.otpDaftarValid(String(b.otp_token || '').trim(), b.telp);
       if (!otp.ok) return fail(otp.err || 'Nomor WhatsApp belum terverifikasi.');
     }
 
     // Pendaftaran publik selalu memakai paket uji coba yang diizinkan, bukan nilai dari browser.
-    const pkgSel = trialPackage();
+    const pkgSel = await trialPackage();
     if (!pkgSel) return fail('Pendaftaran uji coba belum tersedia. Silakan hubungi pengelola layanan.');
-    const trialHari = saas.packageTrialDays(pkgSel);
+    const trialHari = await saas.packageTrialDays(pkgSel);
 
     // ---- 4) batas per jam (setelah validasi dasar) ----
-    if (phoneAlreadyRegistered(b.telp)) return fail('Nomor WhatsApp ini sudah dipakai untuk sekolah lain. Gunakan nomor yang belum terdaftar.');
-    const hit = saas.regHit(ip, email, 'sukses');
+    if (await phoneAlreadyRegistered(b.telp)) return fail('Nomor WhatsApp ini sudah dipakai untuk sekolah lain. Gunakan nomor yang belum terdaftar.');
+    const hit = await saas.regHit(ip, email, 'sukses');
     if (hit.blocked) {
       return res.redirect(back(Object.assign({}, keep, {
-        err: `Terlalu banyak permintaan pendaftaran. Silakan coba beberapa saat lagi (${hit.retryMin || saas.regLimits().blockHours * 60} menit).`
+        err: `Terlalu banyak permintaan pendaftaran. Silakan coba beberapa saat lagi (${hit.retryMin || (await saas.regLimits()).blockHours * 60} menit).`
       })));
     }
 
     try {
-      const tenant = saas.createTenant({
+      const tenant = await saas.createTenant({
         nama, admin_email: email, admin_password: p1,
         admin_nama: adminNama,
         alamat, kepala: '',
@@ -533,9 +582,9 @@ ${ui.themeCss(tema)}
          Bila pembuatan sesi gagal, pengguna diarahkan ke halaman sukses
          berisi kredensial yang sama (token sekali pakai, kedaluwarsa 30 menit).
          ================================================================ */
-      const admin = (() => {
+      const admin = await (async () => {
         try {
-          return dbm.runAsTenant(tenant, () => db.prepare(
+          return await dbm.runAsTenant(tenant, () => db.prepare(
             "SELECT * FROM users WHERE role='super_admin' ORDER BY id LIMIT 1").get());
         } catch (e) { console.error('[daftar] admin sekolah tidak ditemukan:', e.message); return null; }
       })();
@@ -548,24 +597,34 @@ ${ui.themeCss(tema)}
         at: lib.nowStamp()
       };
       let token = null;
-      if (admin && admin.aktif) {
+      if (dbm.DB_DRIVER !== 'mysql' && admin && admin.aktif) {
         try { token = await setSession(admin.id, tenant.id, 0, JSON.stringify(kredensial)); } catch (e) { console.error('[daftar] gagal membuat sesi:', e.message); }
       }
-      try {
-        await dbm.runAsTenant(tenant, () => dbm.logAudit(admin || null, 'DAFTAR', 'auth',
-          `Pendaftaran sekolah ${tenant.nama} (${tenant.school_code}) — admin ${email}`
-          + (token ? ' langsung masuk ke dashboard' : ' diarahkan ke halaman kredensial')));
-      } catch (e) { }
+      if (dbm.DB_DRIVER !== 'mysql') {
+        try {
+          await dbm.runAsTenant(tenant, () => dbm.logAudit(admin || null, 'DAFTAR', 'auth',
+            `Pendaftaran sekolah ${tenant.nama} (${tenant.school_code}) — admin ${email}`
+            + (token ? ' langsung masuk ke dashboard' : ' diarahkan ke halaman kredensial')));
+        } catch (e) { console.error('[daftar-audit]', e.message); }
+      }
       if (token) {
         res.set('Set-Cookie', `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 14}${secureCookie(req)}`);
         return res.redirect(base + '/?welcome=1');
       }
       // ---- fallback: halaman sukses berisi kredensial (token sekali pakai) ----
       const sKey = require('crypto').randomBytes(12).toString('hex');
-      successStore.set(sKey, { ...kredensial, exp: Date.now() + 30 * 60 * 1000 });
+      successStore.set(sKey, {
+        ...kredensial,
+        modulesPending: dbm.DB_DRIVER === 'mysql',
+        exp: Date.now() + 30 * 60 * 1000
+      });
       return res.redirect(base + '/daftar/sukses?t=' + sKey);
     } catch (e) {
-      res.redirect(back(Object.assign({}, keep, { err: e.message })));
+      console.error('[register]', e.message);
+      const safeMessage = /belum dikonfigurasi|sudah berisi data|Paket pendaftaran|tidak menerima pendaftaran mandiri|wajib diisi|tidak valid|sudah dipakai|Password minimal|dibatalkan: Database MySQL tenant/i.test(e.message)
+        ? e.message
+        : 'Pendaftaran gagal diproses. Periksa konfigurasi database tenant atau coba kembali.';
+      return res.redirect(back(Object.assign({}, keep, { err: safeMessage })));
     }
   });
 
@@ -595,17 +654,22 @@ ${ui.themeCss(tema)}
     const sekolah = data ? data.sekolah : '';
     const nama = data ? data.nama : '';
     const pwd = data ? data.password : '';
+    const mysqlModulesPending = !!(data && data.modulesPending);
     res.html(authShell({
       base,
       sideTitle: 'Pendaftaran berhasil!',
-      sideDesc: 'Simpan kredensial di samping, lalu masuk ke dashboard keuangan sekolah Anda.',
+      sideDesc: mysqlModulesPending
+        ? 'Simpan kredensial Anda. Modul aplikasi sekolah masih dalam proses migrasi MySQL.'
+        : 'Simpan kredensial di samping, lalu masuk ke dashboard keuangan sekolah Anda.',
       content: `
       <div class="auth-login-head">
         <div class="auth-logo-ph" style="background:#DCFCE7;color:#15803D">${ui.icon('check')}</div>
         <div class="auth-welcome">Sekolah berhasil didaftarkan</div>
         <div class="small muted">${lib.esc(nama || 'Administrator Sekolah')}${sekolah ? ' · ' + lib.esc(sekolah) : ''}</div>
       </div>
-      <div class="alert ok">${ui.icon('check')}<div>Akun sekolah sudah aktif. <b>Simpan kredensial</b> berikut untuk masuk kembali kapan saja.</div></div>
+      ${mysqlModulesPending
+        ? `<div class="alert warn">${ui.icon('alert')}<div>Pendaftaran berhasil dan akun admin sudah tersimpan. Modul sekolah yang belum selesai dimigrasikan masih mengembalikan status 503, jadi akses dashboard belum tersedia.</div></div>`
+        : `<div class="alert ok">${ui.icon('check')}<div>Akun sekolah sudah aktif. <b>Simpan kredensial</b> berikut untuk masuk kembali kapan saja.</div></div>`}
       <div class="cred-box">
         <div class="cred-row">
           <div><div class="cred-lbl">Kode Sekolah</div>
@@ -626,7 +690,7 @@ ${ui.themeCss(tema)}
         </div>
       </div>
       <p class="help" style="margin-top:10px">Demi keamanan, password hanya ditampilkan sekali di halaman ini. Bila lupa, minta Administrator Pusat meresetnya.</p>
-      <a class="btn btn-primary btn-block" href="${base}/login?kode=${lib.esc(kode)}" style="margin-top:6px">${ui.icon('login')}Masuk ke Dashboard Sekolah</a>
+      <a class="btn btn-primary btn-block" href="${base}/login?kode=${lib.esc(kode)}" style="margin-top:6px">${ui.icon('login')}${mysqlModulesPending ? 'Lanjut ke Halaman Login' : 'Masuk ke Dashboard Sekolah'}</a>
       <p class="small muted" style="margin-top:14px;text-align:center">Alamat masuk: <b>${base}/login</b></p>`
     }));
   });

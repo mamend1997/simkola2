@@ -55,17 +55,14 @@ module.exports = ({ get, post, dbm, lib, ui, saas, queue, uploadMedia, refreshPo
     return out[name] || '';
   }
   function me(req) {
-    const tok = parseCookie(req, COOKIE);
-    const s = saas.getSession(tok);
-    if (!s || s.kind !== 'saas') return null;
-    const u = saas.adminById(s.user_id);
-    return u && u.aktif ? u : null;
+    const user = req.saasUser || null;
+    return user && Number(user.aktif) ? user : null;
   }
   function mfaSetup(req) {
     const token = parseCookie(req, MFA_COOKIE);
-    const session = saas.getSession(token);
+    const session = req.mfaSession;
     if (!session || session.kind !== 'saas_mfa_setup') return null;
-    const user = saas.adminById(session.user_id);
+    const user = req.mfaUser;
     return user && user.aktif ? { token, session, user } : null;
   }
   function secureCookie(req) {
@@ -78,7 +75,7 @@ module.exports = ({ get, post, dbm, lib, ui, saas, queue, uploadMedia, refreshPo
       res.redirect(req.BASE + '/super-admin/login?err=' + encodeURIComponent('Silakan masuk sebagai Super Admin Pusat.'));
       return null;
     }
-    if (!saas.mfaEnabled(u.id)) {
+    if (req.saasMfaEnabled === false) {
       saas.destroySession(parseCookie(req, COOKIE));
       res.set('Set-Cookie', `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureCookie(req)}`);
       res.redirect(req.BASE + '/super-admin/login?err=' + encodeURIComponent('Aktifkan MFA sebelum melanjutkan.'));
@@ -219,44 +216,50 @@ document.addEventListener('click', function(e){ if(e.target.id==='lb'||e.target.
     loginPage(req, res, { err: req.query.get('err') });
   });
 
-  post('/super-admin/login', (req, res) => {
+  post('/super-admin/login', async (req, res) => {
     const email = String(req.body.email || '').trim();
     const pass = String(req.body.password || '');
     const identity = 'superadmin:' + email.toLowerCase();
-    if (saas.authIsLimited(identity)) {
-      return loginPage(req, res, { err: 'Terlalu banyak percobaan masuk. Silakan coba kembali dalam 15 menit.' });
-    }
-    const u = saas.findAdmin(email);
-    if (!u || !lib.verifyPassword(pass, u.password)) {
-      saas.authRecord(identity, false);
-      return res.redirect(req.BASE + '/super-admin/login?err=' + encodeURIComponent('Email atau password salah.'));
-    }
-    if (!u.aktif) {
-      saas.authRecord(identity, false);
-      return res.redirect(req.BASE + '/super-admin/login?err=' + encodeURIComponent('Akun super admin dinonaktifkan.'));
-    }
-    if (saas.mfaEnabled(u.id)) {
-      if (!saas.mfaVerify(u.id, req.body.mfa_code)) {
-        saas.authRecord(identity, false);
-        return loginPage(req, res, { err: 'Kode authenticator atau pemulihan tidak valid.' });
+    try {
+      if (await saas.authIsLimited(identity)) {
+        return loginPage(req, res, { err: 'Terlalu banyak percobaan masuk. Silakan coba kembali dalam 15 menit.' });
       }
-      saas.authRecord(identity, true);
-    } else {
-      saas.authRecord(identity, true);
-      saas.mfaStart(u.id);
-      const setupToken = saas.createSession({ userId: u.id, kind: 'saas_mfa_setup', expiresMinutes: 10 });
-      res.set('Set-Cookie', `${MFA_COOKIE}=${setupToken}; Path=/super-admin; HttpOnly; SameSite=Lax; Max-Age=600${secureCookie(req)}`);
-      return res.redirect(req.BASE + '/super-admin/mfa-setup');
+      const u = await saas.findAdmin(email);
+      if (!u || !lib.verifyPassword(pass, u.password)) {
+        await saas.authRecord(identity, false);
+        return res.redirect(req.BASE + '/super-admin/login?err=' + encodeURIComponent('Email atau password salah.'));
+      }
+      if (!Number(u.aktif)) {
+        await saas.authRecord(identity, false);
+        return res.redirect(req.BASE + '/super-admin/login?err=' + encodeURIComponent('Akun super admin dinonaktifkan.'));
+      }
+      if (await saas.mfaEnabled(u.id)) {
+        if (!await saas.mfaVerify(u.id, req.body.mfa_code)) {
+          await saas.authRecord(identity, false);
+          return loginPage(req, res, { err: 'Kode authenticator atau pemulihan tidak valid.' });
+        }
+        await saas.authRecord(identity, true);
+      } else {
+        await saas.authRecord(identity, true);
+        await saas.mfaStart(u.id);
+        const setupToken = await saas.createSession({ userId: u.id, kind: 'saas_mfa_setup', expiresMinutes: 10 });
+        res.set('Set-Cookie', `${MFA_COOKIE}=${setupToken}; Path=/super-admin; HttpOnly; SameSite=Lax; Max-Age=600${secureCookie(req)}`);
+        return res.redirect(req.BASE + '/super-admin/mfa-setup');
+      }
+      const token = await saas.createSession({ userId: u.id, kind: 'saas' });
+      if (dbm.DB_DRIVER === 'mysql') await saas.markAdminLogin(u.id);
+      else S.prepare('UPDATE saas_users SET last_login=? WHERE id=?').run(nowStamp(), u.id);
+      await saas.logSaas(u, 'LOGIN', 'auth', 'Super Admin Pusat masuk');
+      res.set('Set-Cookie', `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 14}${secureCookie(req)}`);
+      return res.redirect(req.BASE + '/super-admin');
+    } catch (error) {
+      console.error('[super-admin-login]', error.message);
+      return loginPage(req, res, { err: 'Login Super Admin gagal karena layanan database bermasalah. Silakan coba lagi.' });
     }
-    const token = saas.createSession({ userId: u.id, kind: 'saas' });
-    S.prepare('UPDATE saas_users SET last_login=? WHERE id=?').run(nowStamp(), u.id);
-    saas.logSaas(u, 'LOGIN', 'auth', 'Super Admin Pusat masuk');
-    res.set('Set-Cookie', `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 14}${secureCookie(req)}`);
-    res.redirect(req.BASE + '/super-admin');
   });
 
-  post('/super-admin/logout', (req, res) => {
-    saas.destroySession(parseCookie(req, COOKIE));
+  post('/super-admin/logout', async (req, res) => {
+    await saas.destroySession(parseCookie(req, COOKIE));
     res.set('Set-Cookie', `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureCookie(req)}`);
     res.redirect(req.BASE + '/super-admin/login?ok=' + encodeURIComponent('Anda telah keluar.'));
   });
@@ -264,7 +267,7 @@ document.addEventListener('click', function(e){ if(e.target.id==='lb'||e.target.
   get('/super-admin/mfa-setup', async (req, res) => {
     const state = mfaSetup(req);
     if (!state) return res.redirect(req.BASE + '/super-admin/login?err=' + encodeURIComponent('Sesi penyiapan keamanan berakhir. Silakan masuk kembali.'));
-    const secret = saas.mfaPendingSecret(state.user.id);
+    const secret = await saas.mfaPendingSecret(state.user.id);
     if (!secret) return res.redirect(req.BASE + '/super-admin/login?err=' + encodeURIComponent('Penyiapan MFA perlu diulang.'));
     const issuer = saas.appName();
     const uri = `otpauth://totp/${encodeURIComponent(issuer + ':' + state.user.email)}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
@@ -283,20 +286,21 @@ document.addEventListener('click', function(e){ if(e.target.id==='lb'||e.target.
       <button class="btn btn-primary btn-block">Aktifkan MFA</button></form></main></body></html>`);
   });
 
-  post('/super-admin/mfa-setup', (req, res) => {
+  post('/super-admin/mfa-setup', async (req, res) => {
     const state = mfaSetup(req);
     if (!state) return res.redirect(req.BASE + '/super-admin/login?err=' + encodeURIComponent('Sesi penyiapan keamanan berakhir.'));
     const identity = 'superadmin:' + String(state.user.email || '').trim().toLowerCase();
-    if (saas.authIsLimited(identity)) {
+    if (await saas.authIsLimited(identity)) {
       return res.redirect(req.BASE + '/super-admin/mfa-setup?err=' + encodeURIComponent('Terlalu banyak kode yang salah. Silakan coba kembali setelah 15 menit.'));
     }
     try {
-      const codes = saas.mfaEnable(state.user.id, req.body.code);
-      saas.authRecord(identity, true);
-      saas.destroySession(state.token);
-      const token = saas.createSession({ userId: state.user.id, kind: 'saas' });
-      S.prepare('UPDATE saas_users SET last_login=? WHERE id=?').run(nowStamp(), state.user.id);
-      saas.logSaas(state.user, 'AKTIFKAN MFA', 'auth', 'Super Admin Pusat mengaktifkan verifikasi dua langkah');
+      const codes = await saas.mfaEnable(state.user.id, req.body.code);
+      await saas.authRecord(identity, true);
+      await saas.destroySession(state.token);
+      const token = await saas.createSession({ userId: state.user.id, kind: 'saas' });
+      if (dbm.DB_DRIVER === 'mysql') await saas.markAdminLogin(state.user.id);
+      else S.prepare('UPDATE saas_users SET last_login=? WHERE id=?').run(nowStamp(), state.user.id);
+      await saas.logSaas(state.user, 'AKTIFKAN MFA', 'auth', 'Super Admin Pusat mengaktifkan verifikasi dua langkah');
       res.set('Set-Cookie', [
         `${MFA_COOKIE}=; Path=/super-admin; HttpOnly; SameSite=Lax; Max-Age=0${secureCookie(req)}`,
         `${COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 14}${secureCookie(req)}`
@@ -309,7 +313,7 @@ document.addEventListener('click', function(e){ if(e.target.id==='lb'||e.target.
         <div class="mono" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px">${codes.map(x => `<code style="padding:8px;background:#f6f3ef;border-radius:6px">${esc(x)}</code>`).join('')}</div>
         <p style="margin-top:20px"><a class="btn btn-primary btn-block" href="${req.BASE}/super-admin">Saya sudah menyimpan kode</a></p></main></body></html>`);
     } catch (e) {
-        saas.authRecord(identity, false);
+      await saas.authRecord(identity, false);
       res.redirect(req.BASE + '/super-admin/mfa-setup?err=' + encodeURIComponent(e.message));
     }
   });

@@ -9,11 +9,14 @@ if (DB_DRIVER === 'mysql') {
   const { createMysqlRuntime } = require('./mysql-runtime');
   const { createMysqlDatabase } = require('./mysql-database');
   const { createMysqlDbHelpers } = require('./mysql-db-helpers');
+  const { createMysqlAuthStore } = require('./mysql-auth-store');
   const { initializeMysqlSchema } = require('./mysql-schema');
   const schema = require('./db-schema');
   const runtime = createMysqlRuntime();
   const database = createMysqlDatabase(runtime);
   const helpers = createMysqlDbHelpers(database);
+  const authStore = createMysqlAuthStore(database);
+  const metaStore = new (require('node:async_hooks').AsyncLocalStorage)();
   const db = {
     prepare: sql => database.prepare(sql),
     query: (sql, values = []) => database.query(sql, values),
@@ -29,11 +32,17 @@ if (DB_DRIVER === 'mysql') {
   module.exports = {
     DB_DRIVER,
     mysqlRuntime: runtime,
+    mysqlDatabase: database,
+    mysqlHelpers: helpers,
+    mysqlAuthStore: authStore,
     db,
     mainDb: db,
     withTenant: database.withTenant,
+    runAsTenant: database.withTenant,
     withControl: database.withControl,
     currentScope: database.currentScope,
+    runWithMeta: (meta, fn) => metaStore.run(meta || {}, fn),
+    currentMeta: () => metaStore.getStore() || {},
     initializeSchema,
     tableNames: helpers.tableNames,
     tableExists: helpers.tableExists,

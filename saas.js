@@ -19,6 +19,9 @@ const fs = require('fs');
 const crypto = require('crypto');
 const lib = require('./lib');
 const dbm = require('./db');
+if (dbm.DB_DRIVER === 'mysql') {
+  module.exports = require('./mysql-saas');
+} else {
 const paygw = require('./paygw');
 const clean = v => String(v === null || v === undefined ? '' : v).trim();
 
@@ -1655,3 +1658,4 @@ module.exports = {
 Object.assign(module.exports, require('./saas_extra')({
   S, lib, dbm, get, set, allTenants, tenantById, logSaas, todayISO, addDays, daysBetween, PAKET, FEATURES
 }));
+}

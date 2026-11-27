@@ -8,6 +8,546 @@ module.exports = ({ get, post, dbm, lib, ui, page, ctx, guard, can, uploadMedia,
   const BKU_STD_UMUM = ['BKU Umum', 'Buku Kas Pembantu Bank', 'Buku Pembantu Pajak', 'Buku Pembantu Tunai', 'Rekapitulasi Barang Habis Pakai', 'Barang Modal'];
   const BKU_STD_KEGIATAN = ['BKU UKK', 'BKU PKL', 'BKU SPMB', 'BKU Bantuan', 'BKU PSTS Ganjil', 'BKU PSTS Genap', 'BKU ASAS', 'BKU ASAT', 'BKU PSAJ', 'Dana Sosial', 'Infak Jumat'];
 
+  if (dbm.DB_DRIVER === 'mysql') {
+    registerMysqlRoutes();
+    return;
+  }
+
+  function registerMysqlRoutes() {
+    const MYSQL_COA_CATEGORIES = {
+      pendapatan: ['Pendapatan / Penerimaan Kas Masuk', 'green'],
+      pengeluaran: ['Pengeluaran & Belanja (termasuk Pajak, Mutasi Kas & Biaya Administrasi)', 'orange'],
+      pajak: ['Kode Pajak (kelompok Pengeluaran)', 'amber'],
+      mutasi: ['Mutasi Kas & Biaya Administrasi (kelompok Pengeluaran)', 'blue']
+    };
+    const MYSQL_EXPENSE_CATEGORIES = ['pengeluaran', 'pajak', 'mutasi'];
+    const MYSQL_JENJANG = {
+      'PAUD/TK': ['KB', 'TK-A', 'TK-B'], 'SD/MI': ['I', 'II', 'III', 'IV', 'V', 'VI'],
+      'SMP/MTs': ['VII', 'VIII', 'IX'], 'SMA/MA': ['X', 'XI', 'XII'], SMK: ['X', 'XI', 'XII'], KUSTOM: []
+    };
+    const MYSQL_BENTUK = [
+      ['SMK', 'Sekolah Menengah Kejuruan (SMK)'], ['SMA', 'Sekolah Menengah Atas (SMA)'],
+      ['MA', 'Madrasah Aliyah (MA)'], ['SMP', 'Sekolah Menengah Pertama (SMP)'],
+      ['MTS', 'Madrasah Tsanawiyah (MTs)'], ['SD', 'Sekolah Dasar (SD)'],
+      ['MI', 'Madrasah Ibtidaiyah (MI)'], ['PAUD', 'PAUD / TK / RA'], ['LAIN', 'Lainnya / Custom']
+    ];
+    const MYSQL_STATUS = ['Negeri', 'Swasta'];
+    const MYSQL_OWNERSHIP = ['Pemerintah Daerah', 'Yayasan', 'Kementerian Agama', 'Pemerintah Pusat', 'Perorangan', 'Lainnya'];
+    const db = dbm.db;
+    const redirectFlash = (res, base, path, key, message) => res.redirect(
+      `${base || ''}${path}${String(path).includes('?') ? '&' : '?'}${key}=${encodeURIComponent(message)}`
+    );
+
+    async function canMysql(user, moduleName, action = 'view') {
+      if (!user) return false;
+      if (user.role === 'super_admin') return true;
+      const row = await db.prepare('SELECT allowed FROM permissions WHERE role=? AND module=? AND action=?')
+        .get(String(user.role), String(moduleName), String(action));
+      return !!(row && Number(row.allowed) === 1);
+    }
+
+    async function authorize(req, res, moduleName, action) {
+      if (!req.user) {
+        res.redirect((req.BASE || '') + '/login');
+        return false;
+      }
+      if (await canMysql(req.user, moduleName, action)) return true;
+      res.html('<!doctype html><html lang="id"><meta charset="utf-8"><title>Akses ditolak</title>'
+        + '<body><main><h1>Akses ditolak</h1><p>Role Anda tidak memiliki hak akses untuk tindakan ini.</p></main></body></html>', 403);
+      return false;
+    }
+
+    async function context(req) {
+      const [settings, taList, permissionRows] = await Promise.all([
+        dbm.mysqlHelpers.settingsAll(),
+        db.prepare('SELECT id,nama,tanggal_mulai,tanggal_selesai,aktif FROM tahun_ajaran ORDER BY tanggal_mulai DESC,nama DESC,id DESC').all(),
+        db.prepare('SELECT module,action,allowed FROM permissions WHERE role=?').all(String(req.user.role))
+      ]);
+      const permissionMap = new Map(permissionRows.map(row => [`${row.module}|${row.action}`, Number(row.allowed) === 1]));
+      const can = (moduleName, action = 'view') => req.user.role === 'super_admin'
+        || permissionMap.get(`${moduleName}|${action}`) === true;
+      const requested = Number((req.sessionRow && req.sessionRow.ta_id) || req.taId || req.query.get('ta') || 0);
+      const ta = taList.find(row => Number(row.id) === requested)
+        || taList.find(row => Number(row.aktif) === 1) || taList[0] || null;
+      const pending = ta
+        ? await db.prepare(`SELECT COUNT(*) AS c FROM transaksi t JOIN bku b ON b.id=t.bku_id
+            WHERE t.status='pending' AND b.tahun_ajaran_id=?`).get(ta.id)
+        : { c: 0 };
+      return {
+        base: req.BASE || '', settings, ta, taId: ta ? Number(ta.id) : null, taList, can,
+        pendingCount: can('transaksi', 'approve') ? Number(pending.c || 0) : 0
+      };
+    }
+
+    async function render(req, res, c, { title, sub, active, content }) {
+      const tenant = req.tenant || null;
+      let navCfg = null;
+      if (String(c.settings.nav_ui || '').trim()) navCfg = JSON.parse(String(c.settings.nav_ui));
+      res.html(ui.layout({
+        title, sub, user: req.user, active, base: c.base, content, query: req.query,
+        roleLabel: (dbm.ROLE_LABEL && dbm.ROLE_LABEL[req.user.role]) || req.user.role,
+        pendingCount: c.pendingCount, can: c.can, logoStamp: c.settings.sekolah_logo || '',
+        taList: c.taList, taId: c.taId, path: req.url, navHidden: String(c.settings.nav_hidden || ''),
+        navCfg, tema: String(c.settings.tema_warna || '#F97316'),
+        appName: String(c.settings.app_nama || (saas && saas.appName && saas.appName()) || 'SIMKOLA'),
+        appSub: String(c.settings.app_sub || (saas && saas.appSub && saas.appSub()) || 'Sistem Keuangan'),
+        appLogo: String(c.settings.app_logo || c.settings.sekolah_logo || ''),
+        appLogoSmall: String(c.settings.app_logo_small || ''),
+        mode: String(c.settings.mode_tema || 'light') === 'dark' ? 'dark' : 'light',
+        features: saas && saas.enabledKeys ? saas.enabledKeys(tenant) : null,
+        tenantInfo: tenant ? {
+          nama: tenant.nama, kode: tenant.school_code,
+          status: saas && saas.statusOf ? saas.statusOf(tenant) : null, paket: tenant.paket
+        } : null,
+        impersonate: null, announcements: null, notifs: [], notifCount: 0
+      }));
+    }
+
+    async function audit(req, action, moduleName, detail) {
+      const meta = dbm.currentMeta ? dbm.currentMeta() : {};
+      await dbm.mysqlHelpers.logAudit(req.user, action, moduleName, detail, {
+        ...meta, tenantName: req.tenant && req.tenant.nama
+      });
+    }
+
+    async function saveSettings(entries) {
+      return dbm.mysqlDatabase.transaction(async tx => {
+        for (const [key, value] of entries) {
+          await tx.prepare(`INSERT INTO settings (k,v) VALUES (?,?)
+            ON DUPLICATE KEY UPDATE v=VALUES(v)`).run(String(key), String(value == null ? '' : value));
+        }
+      });
+    }
+
+    function modalCollector() {
+      const list = [];
+      const put = (id, opts) => { list.push(ui.modal(id, opts)); return ''; };
+      put.html = () => list.join('');
+      return put;
+    }
+
+    function activeLevels(settings) {
+      let levels = [];
+      try {
+        const parsed = JSON.parse(String(settings.tingkat_aktif || '[]'));
+        if (Array.isArray(parsed)) levels = parsed;
+      } catch { /* use the jenjang preset for malformed legacy values */ }
+      if (!levels.length) levels = MYSQL_JENJANG[String(settings.jenjang_pendidikan || '')] || [];
+      if (!levels.length) levels = ['VII', 'VIII', 'IX'];
+      return levels.map(value => String(value).trim()).filter(Boolean);
+    }
+
+    function websiteValid(value) {
+      const text = String(value || '').trim();
+      if (!text) return true;
+      const bare = text.replace(/^https?:\/\//i, '');
+      return /^(?=.{3,190}$)([a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}(?::\d{2,5})?(?:\/[^\s]*)?$/i.test(bare);
+    }
+
+    function normalizeWebsite(value) {
+      const text = String(value || '').trim();
+      if (!text) return '';
+      return /^https?:\/\//i.test(text) ? text.replace(/\s+/g, '') : 'https://' + text.replace(/^\/+/, '').replace(/\s+/g, '');
+    }
+
+    function layoutField(label, name, value, options = {}) {
+      const { readonly = false, hint = '', extra = '' } = options;
+      return `<div class="field"><label>${esc(label)}</label><input name="${name}" value="${esc(value || '')}" ${readonly ? 'readonly' : ''} ${extra}>${hint ? `<div class="hint">${hint}</div>` : ''}</div>`;
+    }
+
+    async function currentNpsnError(value, tenantId) {
+      const normalized = String(value || '').replace(/\D/g, '').slice(0, 8);
+      if (!normalized) return { normalized, error: null };
+      if (normalized.length !== 8) return { normalized, error: 'NPSN harus tepat 8 digit angka.' };
+      const existing = await dbm.mysqlDatabase.withControl(() => dbm.mysqlDatabase.prepare(
+        'SELECT id FROM tenants WHERE npsn=? LIMIT 1'
+      ).get(normalized));
+      if (existing && Number(existing.id) !== Number(tenantId || 0)) {
+        return { normalized, error: `NPSN ${normalized} sudah dipakai sekolah lain.` };
+      }
+      return { normalized, error: null };
+    }
+
+    get('/tema', async (req, res) => {
+      if (!await authorize(req, res, 'sekolah', 'view')) return;
+      const c = await context(req);
+      const settings = c.settings;
+      const readonly = !c.can('sekolah', 'edit');
+      const color = /^#[0-9a-f]{6}$/i.test(String(settings.tema_warna || '')) ? settings.tema_warna : '#F97316';
+      const palette = [
+        ['#F97316', 'Oranye'], ['#4F46E5', 'Indigo'], ['#0EA5E9', 'Biru'],
+        ['#10B981', 'Hijau'], ['#EF4444', 'Merah'], ['#8B5CF6', 'Violet'],
+        ['#D946EF', 'Magenta'], ['#0F766E', 'Teal'], ['#B45309', 'Emas']
+      ];
+      const content = `<div class="split"><div class="card"><div class="card-head"><div><h3>Tema &amp; Branding Aplikasi</h3>
+        <div class="sub">Warna, mode tampilan, nama aplikasi, dan sub-judul</div></div>${readonly ? ui.badge('Hanya Lihat', 'gray') : ui.badge('Berlaku seketika', 'green')}</div>
+        <form method="post" action="${c.base}/tema">
+          <div class="field"><label>Warna Dasar</label><div class="flex" style="gap:12px">
+            <input type="color" name="tema_warna" value="${esc(color)}" ${readonly ? 'disabled' : ''} data-tema-pick>
+            <input type="text" name="tema_hex" value="${esc(color)}" maxlength="7" ${readonly ? 'readonly' : ''} data-tema-hex></div></div>
+          <div class="toolbar">${palette.map(([hex, name]) => `<button type="button" class="btn btn-sm" data-tema-set="${hex}" ${readonly ? 'disabled' : ''}>${esc(name)}</button>`).join('')}</div>
+          <div class="field"><label>Mode Tampilan</label><label class="check"><input type="radio" name="mode_tema" value="light" ${String(settings.mode_tema || 'light') !== 'dark' ? 'checked' : ''} ${readonly ? 'disabled' : ''}> Terang</label>
+            <label class="check"><input type="radio" name="mode_tema" value="dark" ${String(settings.mode_tema) === 'dark' ? 'checked' : ''} ${readonly ? 'disabled' : ''}> Gelap</label></div>
+          ${layoutField('Nama Aplikasi', 'app_nama', settings.app_nama, { readonly, extra: 'maxlength="60" placeholder="SIMKOLA Sekolah"' })}
+          ${layoutField('Sub-Judul Aplikasi', 'app_sub', settings.app_sub, { readonly, extra: 'maxlength="60" placeholder="Sistem Keuangan"' })}
+          ${readonly ? '' : '<div class="form-actions"><button class="btn btn-primary">Simpan Tema &amp; Nama</button></div>'}
+        </form></div>
+        <div class="card"><div class="card-head"><div><h3>Logo Aplikasi</h3><div class="sub">Logo pada bilah samping dan halaman login</div></div></div>
+          <div class="center" style="padding:14px">${settings.app_logo ? `<img src="${esc(settings.app_logo)}" alt="Logo aplikasi" width="140" height="140" loading="lazy">` : '<div class="brand-mark">SIM</div>'}</div>
+          ${readonly ? '' : `<form method="post" action="${c.base}/tema/logo"><input type="hidden" name="logo_b64" id="app_logo_b64"><input type="hidden" name="logo_b64_small" id="app_logo_b64_small">
+            <div class="field"><label>Pilih Logo</label><input type="file" accept="image/png,image/jpeg,image/svg+xml" data-b64="app_logo_b64" data-thumb="1" data-max="5"></div>
+            <button class="btn btn-primary btn-block">Unggah Logo</button></form>
+            ${settings.app_logo ? `<form method="post" action="${c.base}/tema/logo"><input type="hidden" name="hapus" value="1"><button class="btn btn-danger btn-block mt-1">Hapus Logo</button></form>` : ''}`}
+        </div></div>`;
+      await render(req, res, c, { title: 'Tema & Branding Aplikasi', sub: 'Warna, mode, nama & logo aplikasi', active: 'tema', content });
+    });
+
+    post('/tema', async (req, res) => {
+      if (!await authorize(req, res, 'sekolah', 'edit')) return;
+      const raw = String(req.body.tema_warna || req.body.tema_hex || '').trim();
+      const match = raw.match(/^#?([0-9a-f]{6})$/i);
+      if (!match) return redirectFlash(res, req.BASE, '/tema', 'err', 'Kode warna tidak valid. Gunakan format #RRGGBB.');
+      const entries = [['tema_warna', '#' + match[1].toUpperCase()]];
+      if (req.body.mode_tema !== undefined) entries.push(['mode_tema', req.body.mode_tema === 'dark' ? 'dark' : 'light']);
+      if (req.body.app_nama !== undefined) entries.push(['app_nama', String(req.body.app_nama || '').trim().slice(0, 60) || 'SIMKEU Sekolah']);
+      if (req.body.app_sub !== undefined) entries.push(['app_sub', String(req.body.app_sub || '').replace(/\s+/g, ' ').trim().slice(0, 60)]);
+      await saveSettings(entries);
+      await audit(req, 'EDIT', 'sekolah', `Tema aplikasi diperbarui: warna #${match[1].toUpperCase()}`);
+      return redirectFlash(res, req.BASE, '/tema', 'ok', 'Tema, nama & sub-judul aplikasi disimpan.');
+    });
+
+    post('/tema/logo', async (req, res) => {
+      if (!await authorize(req, res, 'sekolah', 'edit')) return;
+      if (req.body.hapus) {
+        await saveSettings([['app_logo', ''], ['app_logo_small', '']]);
+        await audit(req, 'EDIT', 'sekolah', 'Menghapus logo aplikasi kustom');
+        return redirectFlash(res, req.BASE, '/tema', 'ok', 'Logo aplikasi dihapus.');
+      }
+      const match = String(req.body.logo_b64 || '').match(/^data:(image\/[^;]+);base64,/);
+      if (!match) return redirectFlash(res, req.BASE, '/tema', 'err', 'Pilih berkas logo gambar yang valid.');
+      const ext = (match[1].split('/')[1] || 'png').replace('jpeg', 'jpg').replace('svg+xml', 'svg');
+      const tenantId = Number(req.tenant && req.tenant.id) || 1;
+      const logo = await uploadMedia(req.body.logo_b64, `logo-aplikasi-${Date.now()}.${ext}`, { jenis: 'logo', tenantId });
+      const small = req.body.logo_b64_small
+        ? await uploadMedia(req.body.logo_b64_small, `logo-aplikasi-kecil-${Date.now()}.webp`, { jenis: 'logo', tenantId })
+        : '';
+      const entries = [['app_logo', logo]];
+      if (small) entries.push(['app_logo_small', small]);
+      await saveSettings(entries);
+      await audit(req, 'EDIT', 'sekolah', 'Mengunggah logo aplikasi kustom');
+      return redirectFlash(res, req.BASE, '/tema', 'ok', 'Logo aplikasi diperbarui.');
+    });
+
+    get('/sekolah', async (req, res) => {
+      if (!await authorize(req, res, 'sekolah', 'view')) return;
+      const c = await context(req);
+      const s = c.settings;
+      const readonly = !c.can('sekolah', 'edit');
+      const forms = MYSQL_BENTUK.map(([code, label]) => `<option value="${code}" ${s.sekolah_bentuk === code ? 'selected' : ''}>${esc(label)}</option>`).join('');
+      const status = MYSQL_STATUS.map((value, i) => `<input type="radio" id="mysql_status_${i}" name="sekolah_status" value="${value}" ${s.sekolah_status === value ? 'checked' : ''} ${readonly ? 'disabled' : ''}><label for="mysql_status_${i}">${esc(value)}</label>`).join('');
+      const levels = activeLevels(s);
+      const content = `<div class="split"><div><div class="card mb-3"><div class="card-head"><div><h3>Informasi Umum &amp; Kontak</h3><div class="sub">Identitas yang digunakan pada laporan dan portal</div></div></div>
+        <form method="post" action="${c.base}/sekolah">
+          ${layoutField('Nama Sekolah', 'sekolah_nama', s.sekolah_nama, { readonly, extra: 'required maxlength="150"' })}
+          <div class="row2">${layoutField('NPSN (8 digit)', 'sekolah_npsn', s.sekolah_npsn, { readonly, extra: 'inputmode="numeric" maxlength="8" pattern="[0-9]{8}"' })}
+            ${layoutField('Telepon / WhatsApp', 'sekolah_telp', s.sekolah_telp, { readonly, extra: 'maxlength="40"' })}</div>
+          <div class="row2">${layoutField('Email Resmi', 'sekolah_email', s.sekolah_email, { readonly, extra: 'type="email" maxlength="120"' })}
+            ${layoutField('Website (tanpa https://)', 'sekolah_website', String(s.sekolah_website || '').replace(/^https?:\/\//i, ''), { readonly, extra: 'maxlength="150"' })}</div>
+          <div class="field"><label>Alamat Lengkap Sekolah</label><textarea name="sekolah_alamat" rows="3" ${readonly ? 'readonly' : ''}>${esc(s.sekolah_alamat || '')}</textarea></div>
+          <div class="row2">${layoutField('Nama Kepala Sekolah', 'sekolah_kepala', s.sekolah_kepala, { readonly, extra: 'maxlength="120"' })}
+            ${layoutField('NIP Kepala Sekolah', 'sekolah_nip_kepala', s.sekolah_nip_kepala, { readonly, extra: 'maxlength="40"' })}</div>
+          <div class="row2">${layoutField('Nama Bendahara', 'sekolah_bendahara', s.sekolah_bendahara, { readonly, extra: 'maxlength="120"' })}
+            ${layoutField('NIP Bendahara', 'sekolah_nip_bendahara', s.sekolah_nip_bendahara, { readonly, extra: 'maxlength="40"' })}</div>
+          ${readonly ? '' : '<button class="btn btn-primary">Simpan Identitas</button>'}
+        </form></div>
+        <div class="card"><div class="card-head"><div><h3>Legalitas &amp; Status</h3></div></div>
+          <form method="post" action="${c.base}/sekolah"><input type="hidden" name="bagian" value="legalitas">
+            <div class="field"><label>Bentuk Pendidikan</label><select name="sekolah_bentuk" ${readonly ? 'disabled' : ''}><option value="">— Pilih —</option>${forms}</select></div>
+            <div class="field"><label>Status Sekolah</label><div class="radio-cards" style="grid-template-columns:1fr 1fr">${status}</div></div>
+            <div class="field"><label>Kepemilikan</label><input name="sekolah_kepemilikan" value="${esc(s.sekolah_kepemilikan || '')}" list="mysqlKepemilikan" maxlength="80" ${readonly ? 'readonly' : ''}>
+              <datalist id="mysqlKepemilikan">${MYSQL_OWNERSHIP.map(value => `<option value="${esc(value)}"></option>`).join('')}</datalist></div>
+            <div class="field"><label>Tingkat Kelas Aktif</label><input value="${esc(levels.join(', '))}" readonly></div>
+            ${readonly ? '' : '<button class="btn btn-primary">Simpan Legalitas</button>'}
+          </form></div></div>
+        <div><div class="card mb-3"><div class="card-head"><div><h3>Pratinjau Kop Surat</h3><div class="sub">Identitas sekolah saat ini</div></div></div><div class="doc">${ui.kop(s)}</div></div>
+          <div class="card"><div class="card-head"><div><h3>Logo Sekolah</h3></div></div>
+            <div class="center" style="padding:14px">${s.sekolah_logo ? `<img src="${esc(s.sekolah_logo)}" alt="Logo sekolah" width="140" height="140" loading="lazy">` : ui.icon('school')}</div>
+            ${readonly ? '' : `<form method="post" action="${c.base}/sekolah/logo"><input type="hidden" name="logo_b64" id="mysql_school_logo">
+              <input type="hidden" name="logo_b64_small" id="mysql_school_logo_small"><div class="field"><label>Pilih Logo</label><input type="file" accept="image/*" data-b64="mysql_school_logo" data-thumb="1" data-max="15"></div>
+              <button class="btn btn-primary btn-block">Unggah Logo Sekolah</button></form>
+              ${s.sekolah_logo ? `<form method="post" action="${c.base}/sekolah/logo"><input type="hidden" name="hapus" value="1"><button class="btn btn-danger btn-block mt-1">Hapus Logo</button></form>` : ''}`}
+          </div></div></div>`;
+      await render(req, res, c, { title: 'Identitas Sekolah', sub: 'Nama, NPSN, kontak & legalitas', active: 'sekolah', content });
+    });
+
+    post('/sekolah', async (req, res) => {
+      if (!await authorize(req, res, 'sekolah', 'edit')) return;
+      const email = String(req.body.sekolah_email || '').trim();
+      if (req.body.sekolah_email !== undefined && email && !/^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(email)) {
+        return redirectFlash(res, req.BASE, '/sekolah', 'err', 'Format email sekolah tidak valid.');
+      }
+      if (req.body.sekolah_website !== undefined && !websiteValid(req.body.sekolah_website)) {
+        return redirectFlash(res, req.BASE, '/sekolah', 'err', 'Format website tidak valid.');
+      }
+      if (req.body.sekolah_status !== undefined && req.body.sekolah_status
+        && !MYSQL_STATUS.includes(String(req.body.sekolah_status))) {
+        return redirectFlash(res, req.BASE, '/sekolah', 'err', 'Status sekolah tidak valid.');
+      }
+      if (req.body.sekolah_kepemilikan !== undefined && req.body.sekolah_kepemilikan
+        && !MYSQL_OWNERSHIP.includes(String(req.body.sekolah_kepemilikan))) {
+        return redirectFlash(res, req.BASE, '/sekolah', 'err', 'Pilihan kepemilikan sekolah tidak valid.');
+      }
+      let npsn = null;
+      if (req.body.sekolah_npsn !== undefined) {
+        const result = await currentNpsnError(req.body.sekolah_npsn, req.tenant && req.tenant.id);
+        if (result.error) return redirectFlash(res, req.BASE, '/sekolah', 'err', result.error);
+        npsn = result.normalized;
+      }
+      const settings = await dbm.mysqlHelpers.settingsAll();
+      const updates = [];
+      const keys = ['sekolah_nama', 'sekolah_alamat', 'sekolah_kepala', 'sekolah_nip_kepala',
+        'sekolah_bendahara', 'sekolah_nip_bendahara', 'sekolah_telp', 'sekolah_email',
+        'sekolah_status', 'sekolah_kepemilikan'];
+      for (const key of keys) {
+        if (req.body[key] !== undefined) updates.push([key, String(req.body[key]).trim()]);
+      }
+      if (req.body.sekolah_website !== undefined) updates.push(['sekolah_website', normalizeWebsite(req.body.sekolah_website)]);
+      if (npsn !== null) updates.push(['sekolah_npsn', npsn]);
+      let presetInfo = '';
+      const bentukJenjang = { SMK: 'SMK', SMA: 'SMA/MA', MA: 'SMA/MA', SMP: 'SMP/MTs', MTS: 'SMP/MTs', SD: 'SD/MI', MI: 'SD/MI', PAUD: 'PAUD/TK' };
+      const selectedJenjang = req.body.jenjang_pendidikan !== undefined && !req.body.sekolah_bentuk
+        ? String(req.body.jenjang_pendidikan || '').trim()
+        : (req.body.sekolah_bentuk !== undefined
+          ? bentukJenjang[String(req.body.sekolah_bentuk || '').trim().toUpperCase()]
+          : '');
+      const levelUpdates = [];
+      if (req.body.sekolah_bentuk !== undefined) {
+        const bentuk = String(req.body.sekolah_bentuk || '').trim().toUpperCase();
+        if (bentuk && !MYSQL_BENTUK.some(([code]) => code === bentuk)) {
+          return redirectFlash(res, req.BASE, '/sekolah', 'err', 'Bentuk pendidikan tidak valid.');
+        }
+        levelUpdates.push(['sekolah_bentuk', bentuk]);
+      }
+      if (selectedJenjang && Object.prototype.hasOwnProperty.call(MYSQL_JENJANG, selectedJenjang)) {
+        const prior = String(settings.jenjang_pendidikan || '');
+        if (selectedJenjang !== prior) {
+          levelUpdates.push(['jenjang_pendidikan', selectedJenjang]);
+          const preset = MYSQL_JENJANG[selectedJenjang];
+          if (preset.length) {
+            levelUpdates.push(['tingkat_aktif', JSON.stringify(preset)]);
+            presetInfo = ` Preset tingkat ${selectedJenjang}: ${preset.join(', ')}.`;
+          }
+        }
+      }
+      await saveSettings([...updates, ...levelUpdates]);
+      if (npsn !== null && req.tenant) {
+        await dbm.mysqlDatabase.withControl(() => dbm.mysqlDatabase.prepare(
+          'UPDATE tenants SET npsn=?,updated_at=? WHERE id=?'
+        ).run(npsn, nowStamp(), Number(req.tenant.id)));
+      }
+      const updatedSettings = await dbm.mysqlHelpers.settingsAll();
+      await audit(req, 'EDIT', 'sekolah',
+        `Memperbarui identitas resmi sekolah (NPSN ${updatedSettings.sekolah_npsn || '-'}, bentuk ${updatedSettings.sekolah_bentuk || '-'})`);
+      return redirectFlash(res, req.BASE, '/sekolah', 'ok', 'Identitas sekolah berhasil disimpan.' + presetInfo);
+    });
+
+    post('/sekolah/logo', async (req, res) => {
+      if (!await authorize(req, res, 'sekolah', 'edit')) return;
+      if (req.body.hapus) {
+        await saveSettings([['sekolah_logo', ''], ['sekolah_logo_small', '']]);
+        await audit(req, 'EDIT', 'sekolah', 'Menghapus logo sekolah');
+        return redirectFlash(res, req.BASE, '/sekolah', 'ok', 'Logo sekolah dihapus.');
+      }
+      const match = String(req.body.logo_b64 || '').match(/^data:(image\/[^;]+);base64,/);
+      if (!match) return redirectFlash(res, req.BASE, '/sekolah', 'err', 'Pilih berkas logo gambar yang valid.');
+      const ext = (match[1].split('/')[1] || 'png').replace('jpeg', 'jpg').replace('svg+xml', 'svg');
+      const tenantId = Number(req.tenant && req.tenant.id) || 1;
+      const logo = await uploadMedia(req.body.logo_b64, `logo-sekolah-${Date.now()}.${ext}`, { jenis: 'logo', tenantId });
+      const small = req.body.logo_b64_small
+        ? await uploadMedia(req.body.logo_b64_small, `logo-sekolah-kecil-${Date.now()}.webp`, { jenis: 'logo', tenantId })
+        : '';
+      const entries = [['sekolah_logo', logo]];
+      if (small) entries.push(['sekolah_logo_small', small]);
+      await saveSettings(entries);
+      await audit(req, 'EDIT', 'sekolah', 'Mengunggah logo sekolah');
+      return redirectFlash(res, req.BASE, '/sekolah', 'ok', 'Logo sekolah berhasil diunggah.');
+    });
+
+    get('/coa', async (req, res) => {
+      if (!await authorize(req, res, 'coa', 'view')) return;
+      const c = await context(req);
+      const rows = await db.prepare('SELECT * FROM coa ORDER BY kategori,kode').all();
+      const counts = await db.prepare('SELECT coa_id,COUNT(*) AS n FROM transaksi GROUP BY coa_id').all();
+      const transactionCounts = new Map(counts.map(row => [Number(row.coa_id), Number(row.n)]));
+      const late = modalCollector();
+      const nextCode = category => {
+        const base = category === 'pendapatan' ? '4.1' : category === 'pengeluaran' ? '5.2'
+          : category === 'pajak' ? '2.1' : '9.1';
+        const codes = rows.filter(row => row.kategori === category && String(row.kode).startsWith(base + '.'))
+          .map(row => Number(String(row.kode).split('.').pop()) || 0);
+        return `${base}.${String((codes.length ? Math.max(...codes) : 0) + 1).padStart(2, '0')}`;
+      };
+      const form = (row, formId) => `<form method="post" action="${c.base}/coa/save" id="${formId}">
+        <input type="hidden" name="id" value="${row ? row.id : ''}">
+        <div class="row2"><div class="field"><label>Kode Rekening</label><input name="kode" value="${esc(row ? row.kode : '')}" required></div>
+          <div class="field"><label>Kategori</label><select name="kategori">${Object.entries(MYSQL_COA_CATEGORIES).map(([key, value]) => `<option value="${key}" ${row && row.kategori === key ? 'selected' : ''}>${esc(value[0])}</option>`).join('')}</select></div></div>
+        <div class="field"><label>Nama Rekening</label><input name="nama" value="${esc(row ? row.nama : '')}" required></div></form>`;
+      let content = '';
+      for (const [category, [label]] of Object.entries(MYSQL_COA_CATEGORIES)) {
+        const list = rows.filter(row => row.kategori === category);
+        content += `<div class="card mb-3"><div class="card-head"><div><h3>${esc(label)}</h3><div class="sub">${list.length} kode rekening</div></div>
+          ${c.can('coa', 'create') ? ui.openModalBtn('mAdd_' + category, 'Tambah Kode', 'btn btn-sm') : ''}</div>
+          ${list.length ? `<div class="table-wrap sticky-head"><table><thead><tr><th>Kode</th><th>Nama Rekening</th><th class="num">Transaksi</th><th class="right">Aksi</th></tr></thead><tbody>
+            ${list.map(row => `<tr><td class="mono t-strong">${esc(row.kode)}</td><td>${esc(row.nama)}</td><td class="num">${transactionCounts.get(Number(row.id)) || 0}</td>
+              <td class="right nowrap">${c.can('coa', 'edit') ? `<button class="btn btn-sm btn-icon" data-open="mE${row.id}">${ui.icon('edit')}</button>` : ''}
+                ${c.can('coa', 'delete') ? `<form method="post" action="${c.base}/coa/delete" style="display:inline" data-confirm="Hapus kode rekening ${esc(row.kode)}?"><input type="hidden" name="id" value="${row.id}"><button class="btn btn-sm btn-danger">${ui.icon('trash')}</button></form>` : ''}</td></tr>
+              ${late('mE' + row.id, { title: 'Edit Kode Rekening', body: form(row, 'fmE' + row.id),
+                footer: `<button class="btn" data-close="mE${row.id}">Batal</button><button class="btn btn-primary" form="fmE${row.id}">Simpan</button>` })}`).join('')}
+          </tbody></table></div>` : ui.emptyState('Belum ada kode rekening di kategori ini')}
+          ${late.html()}${c.can('coa', 'create') ? ui.modal('mAdd_' + category, {
+            title: 'Tambah Kode Rekening', body: `<form method="post" action="${c.base}/coa/save" id="fadd_${category}">
+              <div class="field"><label>Kode Rekening</label><input name="kode" value="${esc(nextCode(category))}" required></div>
+              <div class="field"><label>Kategori</label><input value="${esc(label)}" readonly><input type="hidden" name="kategori" value="${category}"></div>
+              <div class="field"><label>Nama Rekening</label><input name="nama" required></div></form>`,
+            footer: `<button class="btn" data-close="mAdd_${category}">Batal</button><button class="btn btn-primary" form="fadd_${category}">Simpan</button>`
+          }) : ''}</div>`;
+      }
+      await render(req, res, c, { title: 'Kode Rekening (CoA)', sub: 'Bagan akun pendapatan, belanja, pajak & mutasi kas', active: 'coa', content });
+    });
+
+    post('/coa/save', async (req, res) => {
+      const isEdit = !!req.body.id;
+      if (!await authorize(req, res, 'coa', isEdit ? 'edit' : 'create')) return;
+      const kode = String(req.body.kode || '').trim();
+      const nama = String(req.body.nama || '').trim();
+      const kategori = String(req.body.kategori || '').trim();
+      if (!kode || !nama || !Object.prototype.hasOwnProperty.call(MYSQL_COA_CATEGORIES, kategori)) {
+        return redirectFlash(res, req.BASE, '/coa', 'err', 'Kode, nama, dan kategori rekening wajib diisi dengan benar.');
+      }
+      if (isEdit && !MYSQL_EXPENSE_CATEGORIES.includes(kategori)) {
+        const row = await db.prepare('SELECT COUNT(*) AS c FROM bku_rab WHERE coa_id=?').get(req.body.id);
+        if (Number(row && row.c || 0)) return redirectFlash(res, req.BASE, '/coa', 'err', 'Kategori rekening tidak dapat diubah karena sudah dipakai pada RAB BKU.');
+      }
+      if (isEdit) {
+        await db.prepare('UPDATE coa SET kode=?,nama=?,kategori=? WHERE id=?').run(kode, nama, kategori, Number(req.body.id));
+      } else {
+        await db.prepare('INSERT INTO coa (kode,nama,kategori,aktif) VALUES (?,?,?,1)').run(kode, nama, kategori);
+      }
+      await audit(req, isEdit ? 'EDIT' : 'TAMBAH', 'coa', `${isEdit ? 'Edit' : 'Tambah'} kode rekening ${kode} ${nama}`);
+      return redirectFlash(res, req.BASE, '/coa', 'ok', 'Kode rekening disimpan.');
+    });
+
+    post('/coa/delete', async (req, res) => {
+      if (!await authorize(req, res, 'coa', 'delete')) return;
+      const id = Number(req.body.id || 0);
+      const row = id ? await db.prepare('SELECT * FROM coa WHERE id=?').get(id) : null;
+      if (!row) return redirectFlash(res, req.BASE, '/coa', 'err', 'Kode rekening tidak ditemukan.');
+      const [transactions, rab] = await Promise.all([
+        db.prepare('SELECT COUNT(*) AS c FROM transaksi WHERE coa_id=?').get(id),
+        db.prepare('SELECT COUNT(*) AS c FROM bku_rab WHERE coa_id=?').get(id)
+      ]);
+      if (Number(transactions.c || 0)) return redirectFlash(res, req.BASE, '/coa', 'err', 'Kode rekening sudah dipakai transaksi, tidak bisa dihapus.');
+      if (Number(rab.c || 0)) return redirectFlash(res, req.BASE, '/coa', 'err', 'Kode rekening sudah dipakai pada RAB BKU, tidak bisa dihapus.');
+      await db.prepare('DELETE FROM coa WHERE id=?').run(id);
+      await audit(req, 'HAPUS', 'coa', `Menghapus kode rekening ${row.kode} ${row.nama}`);
+      return redirectFlash(res, req.BASE, '/coa', 'ok', 'Kode rekening dihapus.');
+    });
+
+    get('/anggaran', async (req, res) => {
+      if (!await authorize(req, res, 'anggaran', 'view')) return;
+      const c = await context(req);
+      const taId = Number(req.query.get('ta') || c.taId || 0);
+      const taList = c.taList;
+      const marks = MYSQL_EXPENSE_CATEGORIES.map(() => '?').join(',');
+      const [coaList, rows] = await Promise.all([
+        db.prepare(`SELECT * FROM coa WHERE kategori IN (${marks}) ORDER BY kode`).all(...MYSQL_EXPENSE_CATEGORIES),
+        taId ? db.prepare(`SELECT a.*,c.kode,c.nama,
+          COALESCE((SELECT SUM(t.nominal) FROM transaksi t JOIN bku b ON b.id=t.bku_id
+            WHERE t.coa_id=a.coa_id AND t.status='posted' AND t.jenis='pengeluaran'
+              AND b.tahun_ajaran_id=a.tahun_ajaran_id),0) AS realisasi
+          FROM anggaran a JOIN coa c ON c.id=a.coa_id
+          WHERE a.tahun_ajaran_id=? ORDER BY c.kode`).all(taId) : Promise.resolve([])
+      ]);
+      const totalPagu = rows.reduce((sum, row) => sum + Number(row.pagu || 0), 0);
+      const totalActual = rows.reduce((sum, row) => sum + Number(row.realisasi || 0), 0);
+      const late = modalCollector();
+      const content = `<div class="kpi-grid mb-3">
+        <div class="kpi ic-orange"><div class="lbl">Total Pagu</div><div class="val">${rupiah(totalPagu)}</div><div class="meta">${rows.length} kode rekening</div></div>
+        <div class="kpi ic-red"><div class="lbl">Realisasi</div><div class="val">${rupiah(totalActual)}</div><div class="meta">Pengeluaran terposting</div></div>
+        <div class="kpi ic-green"><div class="lbl">Sisa Pagu</div><div class="val">${rupiah(totalPagu - totalActual)}</div><div class="meta">${totalPagu ? (totalActual / totalPagu * 100).toFixed(1) : 0}% terserap</div></div>
+        <div class="kpi ic-amber"><div class="lbl">Rekening Over</div><div class="val">${rows.filter(row => Number(row.realisasi) > Number(row.pagu)).length}</div><div class="meta">Melebihi pagu anggaran</div></div></div>
+        <div class="card"><div class="card-head"><div><h3>Pagu Anggaran per Kode Rekening</h3><div class="sub">Tahun ajaran ${esc((taList.find(row => Number(row.id) === taId) || {}).nama || '-')}</div></div>
+          <div class="toolbar"><form method="get" action="${c.base}/anggaran"><select name="ta" data-autosubmit>${taList.map(row => `<option value="${row.id}" ${Number(row.id) === taId ? 'selected' : ''}>TA ${esc(row.nama)}</option>`).join('')}</select></form>
+            ${c.can('anggaran', 'create') ? ui.openModalBtn('mAdd', 'Tambah Pagu') : ''}</div></div>
+          ${rows.length ? `<div class="table-wrap sticky-head"><table><thead><tr><th>Kode</th><th>Uraian Belanja</th><th class="num">Pagu</th><th class="num">Realisasi</th><th class="num">Sisa</th><th>Serapan</th><th class="right">Aksi</th></tr></thead><tbody>
+            ${rows.map(row => {
+              const pagu = Number(row.pagu || 0), realisasi = Number(row.realisasi || 0);
+              const pct = pagu > 0 ? realisasi / pagu * 100 : (realisasi > 0 ? 100 : 0);
+              const over = realisasi > pagu;
+              return `<tr><td class="mono">${esc(row.kode)}</td><td>${esc(row.nama)}${over ? ' ' + ui.badge('Over', 'red') : ''}</td>
+                <td class="num">${rupiah(pagu)}</td><td class="num">${rupiah(realisasi)}</td><td class="num">${rupiah(pagu - realisasi)}</td>
+                <td>${ui.prog(pct, over ? 'r' : pct > 85 ? '' : 'g')}<div class="t-sub">${pct.toFixed(0)}%</div></td>
+                <td class="right nowrap">${c.can('anggaran', 'edit') ? `<button class="btn btn-sm btn-icon" data-open="mE${row.id}">${ui.icon('edit')}</button>` : ''}
+                  ${c.can('anggaran', 'delete') ? `<form method="post" action="${c.base}/anggaran/delete" style="display:inline" data-confirm="Hapus pagu ${esc(row.nama)}?"><input type="hidden" name="id" value="${row.id}"><button class="btn btn-sm btn-danger">${ui.icon('trash')}</button></form>` : ''}</td></tr>
+                ${late('mE' + row.id, { title: 'Edit Pagu Anggaran', body: `<form method="post" action="${c.base}/anggaran/save" id="fa${row.id}">
+                  <input type="hidden" name="id" value="${row.id}"><input type="hidden" name="tahun_ajaran_id" value="${row.tahun_ajaran_id}">
+                  <input type="hidden" name="coa_id" value="${row.coa_id}">
+                  <div class="field"><label>Kode Rekening</label><input value="${esc(row.kode + ' — ' + row.nama)}" readonly></div>
+                  <div class="field"><label>Pagu (Rp)</label>${ui.moneyInput('pagu', pagu, 'required')}</div>
+                  <div class="field"><label>Keterangan</label><input name="keterangan" value="${esc(row.keterangan || '')}"></div></form>`,
+                  footer: `<button class="btn" data-close="mE${row.id}">Batal</button><button class="btn btn-primary" form="fa${row.id}">Simpan</button>` })}`;
+            }).join('')}
+          </tbody><tfoot><tr><td colspan="2">TOTAL</td><td class="num">${rupiah(totalPagu)}</td><td class="num">${rupiah(totalActual)}</td><td class="num">${rupiah(totalPagu - totalActual)}</td><td colspan="2"></td></tr></tfoot></table></div>` : ui.emptyState('Belum ada pagu anggaran', 'Tambahkan pagu per kode rekening belanja untuk tahun ajaran ini.')}
+          ${late.html()}
+          ${ui.modal('mAdd', { title: 'Tambah / Perbarui Pagu Anggaran', body: `<form method="post" action="${c.base}/anggaran/save" id="fAdd">
+            <div class="field"><label>Tahun Ajaran</label><select name="tahun_ajaran_id">${ui.selectOptions(taList, taId)}</select></div>
+            <div class="field"><label>Kode Rekening Belanja</label><select name="coa_id" required><option value="">— Pilih —</option>${coaList.map(row => `<option value="${row.id}">${esc(row.kode + ' · ' + row.nama)}</option>`).join('')}</select></div>
+            <div class="field"><label>Pagu (Rp)</label>${ui.moneyInput('pagu', '', 'required')}</div><div class="field"><label>Keterangan</label><input name="keterangan"></div></form>`,
+            footer: '<button class="btn" data-close="mAdd">Batal</button><button class="btn btn-primary" form="fAdd">Simpan</button>' })}</div>`;
+      await render(req, res, c, { title: 'Anggaran RAPBS / RKAS', sub: 'Pagu & realisasi per kode rekening', active: 'anggaran', content });
+    });
+
+    post('/anggaran/save', async (req, res) => {
+      const isEdit = !!req.body.id;
+      if (!await authorize(req, res, 'anggaran', isEdit ? 'edit' : 'create')) return;
+      const taId = Number(req.body.tahun_ajaran_id || 0);
+      const coaId = Number(req.body.coa_id || 0);
+      if (!taId || (!isEdit && !coaId)) return redirectFlash(res, req.BASE, '/anggaran', 'err', 'Tahun ajaran dan kode rekening wajib dipilih.');
+      if (isEdit) {
+        const existing = await db.prepare('SELECT id,tahun_ajaran_id FROM anggaran WHERE id=?')
+          .get(Number(req.body.id));
+        if (!existing) return redirectFlash(res, req.BASE, '/anggaran', 'err', 'Pagu anggaran tidak ditemukan.');
+      } else {
+        const [ta, coa] = await Promise.all([
+          db.prepare('SELECT id FROM tahun_ajaran WHERE id=?').get(taId),
+          db.prepare('SELECT id FROM coa WHERE id=? AND kategori IN (?,?,?)').get(
+            coaId, ...MYSQL_EXPENSE_CATEGORIES
+          )
+        ]);
+        if (!ta || !coa) return redirectFlash(res, req.BASE, '/anggaran', 'err', 'Tahun ajaran atau kode rekening belanja tidak valid.');
+      }
+      const value = lib.parseMoney(req.body.pagu);
+      const keterangan = String(req.body.keterangan || '');
+      if (isEdit) {
+        await db.prepare('UPDATE anggaran SET pagu=?,keterangan=? WHERE id=?').run(value, keterangan, Number(req.body.id));
+      } else {
+        await db.prepare(`INSERT INTO anggaran (tahun_ajaran_id,coa_id,pagu,keterangan) VALUES (?,?,?,?)
+          ON DUPLICATE KEY UPDATE pagu=VALUES(pagu),keterangan=VALUES(keterangan)`).run(taId, coaId, value, keterangan);
+      }
+      await audit(req, 'EDIT', 'anggaran', `Menetapkan pagu anggaran Rp ${num(value)} (coa ${coaId}, TA ${taId})`);
+      return redirectFlash(res, req.BASE, `/anggaran?ta=${taId}`, 'ok', 'Pagu anggaran disimpan.');
+    });
+
+    post('/anggaran/delete', async (req, res) => {
+      if (!await authorize(req, res, 'anggaran', 'delete')) return;
+      const id = Number(req.body.id || 0);
+      if (!id) return redirectFlash(res, req.BASE, '/anggaran', 'err', 'Pagu anggaran tidak ditemukan.');
+      await db.prepare('DELETE FROM anggaran WHERE id=?').run(id);
+      await audit(req, 'HAPUS', 'anggaran', `Menghapus pagu anggaran id ${id}`);
+      return redirectFlash(res, req.BASE, '/anggaran', 'ok', 'Pagu anggaran dihapus.');
+    });
+  }
+
   /** kumpulkan modal agar dirender DI LUAR tabel (form di dalam <table> akan dipecah parser HTML) */
   function modalCollector() {
     const list = [];
