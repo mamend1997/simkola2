@@ -53,6 +53,15 @@ function createMysqlAuthStore(database) {
       FROM users WHERE id=?`).get(Number(userId) || 0) || null);
   }
 
+  function markSchoolLogin(tenant, userId) {
+    if (!tenant || !Number.isInteger(Number(tenant.id)) || Number(tenant.id) < 1) {
+      return Promise.reject(new Error('Tenant sekolah tidak valid.'));
+    }
+    return database.withTenant(tenant, () => database.prepare(
+      'UPDATE users SET last_login=? WHERE id=?'
+    ).run(lib.nowStamp(), Number(userId) || 0));
+  }
+
   async function createSession({ userId, tenantId, kind, alertPending, welcome, expiresMinutes } = {}) {
     const token = lib.token(24);
     const expiresAt = expiresMinutes
@@ -137,18 +146,50 @@ function createMysqlAuthStore(database) {
     }));
   }
 
+  async function authenticateSchool({ schoolCode, identity, password, limit = 5, windowMinutes = 15 } = {}) {
+    const ident = String(identity || '').trim();
+    const authIdentity = `school:${ident.toLowerCase()}`;
+    if (await authIsLimited(authIdentity, { limit, windowMinutes })) {
+      return { ok: false, reason: 'rate_limited' };
+    }
+
+    const code = String(schoolCode || '').trim().toUpperCase();
+    const tenant = code ? await tenantByCode(code) : await tenantById(1);
+    if (!tenant) {
+      await authRecord(authIdentity, false);
+      return { ok: false, reason: code ? 'tenant_not_found' : 'tenant_missing' };
+    }
+
+    const user = await schoolUserByIdentity(tenant, ident);
+    if (!user || !lib.verifyPassword(password, user.password)) {
+      await authRecord(authIdentity, false);
+      return { ok: false, reason: 'invalid_credentials' };
+    }
+    if (!Number(user.aktif)) {
+      await authRecord(authIdentity, false);
+      return { ok: false, reason: 'account_disabled' };
+    }
+
+    await markSchoolLogin(tenant, user.id);
+    await authRecord(authIdentity, true);
+    const token = await createSession({ userId: user.id, tenantId: tenant.id, kind: 'tenant' });
+    return { ok: true, tenant, user, token };
+  }
+
   return {
     tenantById,
     tenantByCode,
     schoolUserByIdentity,
     schoolUserById,
+    markSchoolLogin,
     createSession,
     getSession,
     destroySession,
     updateSession,
     adminById,
     authIsLimited,
-    authRecord
+    authRecord,
+    authenticateSchool
   };
 }
 

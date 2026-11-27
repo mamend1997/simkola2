@@ -7,6 +7,8 @@ const { createMysqlRuntime, readConfig } = require('../mysql-runtime');
 const { createMysqlDatabase } = require('../mysql-database');
 const { createMysqlDbHelpers } = require('../mysql-db-helpers');
 const { createMysqlAuthStore } = require('../mysql-auth-store');
+const { mysqlSchemaStatements, initializeMysqlSchema } = require('../mysql-schema');
+const appSchema = require('../db-schema');
 const lib = require('../lib');
 
 const baseEnv = {
@@ -21,20 +23,58 @@ const baseEnv = {
 assert.throws(() => readConfig({ ...baseEnv, MYSQL_TENANT_DB: 'bad-name' }), /tidak valid/);
 assert.throws(() => readConfig({ ...baseEnv, MYSQL_CONTROL_DB: 'school_db' }), /harus berbeda/);
 assert.throws(() => readConfig({ ...baseEnv, MYSQL_PORT: '0' }), /MYSQL_PORT/);
+assert.throws(() => readConfig({ ...baseEnv, MYSQL_TENANT_DATABASES: '{invalid' }), /JSON object yang valid/);
+assert.throws(() => readConfig({ ...baseEnv, MYSQL_TENANT_DATABASES: '{"2":"control_db"}' }), /tidak boleh sama/);
+assert.throws(() => readConfig({ ...baseEnv, MYSQL_TENANT_DATABASES: '{"0":"school_zero"}' }), /ID tenant/);
 
-const mysqlStartup = spawnSync(process.execPath, ['-e', "require('./db')"], {
+const mysqlStartup = spawnSync(process.execPath, ['-e', `
+  const assert = require('node:assert/strict');
+  const mysqlDb = require('./db');
+  assert.equal(mysqlDb.DB_DRIVER, 'mysql');
+  assert.equal(typeof mysqlDb.mysqlRuntime.schoolPool, 'function');
+  assert.equal(typeof mysqlDb.withTenant, 'function');
+  assert.equal(typeof mysqlDb.withControl, 'function');
+  assert.equal(typeof mysqlDb.initializeSchema, 'function');
+  assert.equal(typeof mysqlDb.tableNames, 'function');
+  assert.equal(typeof mysqlDb.columns, 'function');
+  assert.equal(typeof mysqlDb.db.get, 'function');
+  assert.equal(typeof mysqlDb.db.all, 'function');
+  assert.equal(typeof mysqlDb.db.run, 'function');
+  assert.equal(typeof mysqlDb.db.transaction, 'function');
+  assert.equal(typeof mysqlDb.db.prepare('SELECT 1').get, 'function');
+  console.log('MYSQL_DB_API_READY');
+`], {
   cwd: path.join(__dirname, '..'),
-  env: { ...process.env, DB_DRIVER: 'mysql' },
+  env: {
+    ...process.env,
+    DB_DRIVER: 'mysql',
+    MYSQL_HOST: 'localhost',
+    MYSQL_PORT: '3306',
+    MYSQL_USER: 'test',
+    MYSQL_PASSWORD: 'test-only',
+    MYSQL_TENANT_DB: 'school_db',
+    MYSQL_CONTROL_DB: 'control_db'
+  },
   encoding: 'utf8'
 });
-assert.notEqual(mysqlStartup.status, 0, 'MySQL mode must not silently start the SQLite application');
-assert.match(mysqlStartup.stderr, /runtime aplikasi belum dipindahkan sepenuhnya ke MySQL/);
+assert.equal(mysqlStartup.status, 0, mysqlStartup.stderr || mysqlStartup.error?.message);
+assert.match(mysqlStartup.stdout, /MYSQL_DB_API_READY/);
+
+const mysqlDdl = mysqlSchemaStatements(appSchema);
+assert.ok(mysqlDdl.length > 0);
+assert.ok(mysqlDdl.some(sql => /CREATE TABLE IF NOT EXISTS users .*AUTO_INCREMENT/.test(sql)));
+assert.ok(mysqlDdl.some(sql => /CREATE TABLE IF NOT EXISTS permissions .*PRIMARY KEY \(role, module, action\)/.test(sql)));
+assert.ok(mysqlDdl.some(sql => /CREATE INDEX idx_piutang_nama ON piutang \(nama_pegawai\(191\)\)/.test(sql)));
+assert.ok(mysqlDdl.every(sql => !/AUTOINCREMENT|sqlite_master|PRAGMA|ON CONFLICT|INDEX IF NOT EXISTS/i.test(sql)));
 
 const calls = [];
 let mismatchControlDatabase = false;
 const sessions = new Map();
 const tenantRow = { id: 1, school_code: 'AB12', nama: 'Sekolah Uji', db_file: 'unused' };
-const schoolUser = { id: 7, nama: 'Admin Uji', email: 'admin@sekolah.test', username: 'admin', password: 'hash', aktif: 1 };
+const schoolUser = {
+  id: 7, nama: 'Admin Uji', email: 'admin@sekolah.test', username: 'admin',
+  password: lib.hashPassword('secret'), aktif: 1
+};
 function fakePool(config) {
   calls.push({ type: 'pool', database: config.database, config });
   return {
@@ -60,7 +100,8 @@ function fakePool(config) {
         return [String(values[0]).toUpperCase() === tenantRow.school_code ? [tenantRow] : [], []];
       }
       if (/FROM users\s+WHERE LOWER\(email\)/i.test(sql)) {
-        return [[schoolUser], []];
+        const ident = String(values[0] || '').toLowerCase();
+        return [ident === 'admin' || ident === 'admin@sekolah.test' ? [schoolUser] : [], []];
       }
       if (/FROM users WHERE id=/i.test(sql)) {
         return [Number(values[0]) === schoolUser.id ? [schoolUser] : [], []];
@@ -120,6 +161,57 @@ function fakePool(config) {
 }
 
 async function main() {
+  const initializedDdl = [];
+  const introspectionQueries = [];
+  const schemaTableRows = mysqlDdl.filter(sql => sql.startsWith('CREATE TABLE')).map(sql => ({
+    name: sql.match(/^CREATE TABLE IF NOT EXISTS ([A-Za-z_][A-Za-z0-9_]*)/)[1]
+  }));
+  const schemaColumns = new Map(schemaTableRows.map(({ name }) => [name, new Set()]));
+  for (const sql of mysqlDdl.filter(statement => statement.startsWith('CREATE TABLE'))) {
+    const table = sql.match(/^CREATE TABLE IF NOT EXISTS ([A-Za-z_][A-Za-z0-9_]*)/)[1];
+    const body = sql.match(/\(([\s\S]*)\) ENGINE=/)[1];
+    const names = [...body.matchAll(/(?:^|, )([A-Za-z_][A-Za-z0-9_]*) (?:BIGINT|DOUBLE|VARCHAR|LONGTEXT)/g)]
+      .map(match => match[1]);
+    names.forEach(name => schemaColumns.get(table).add(name));
+  }
+  const fakeSchemaDatabase = {
+    async query(sql) {
+      initializedDdl.push(sql);
+      const added = sql.match(/^ALTER TABLE `([A-Za-z_][A-Za-z0-9_]*)` ADD COLUMN `([A-Za-z_][A-Za-z0-9_]*)`/);
+      if (added) schemaColumns.get(added[1]).add(added[2]);
+      return { affectedRows: 0 };
+    },
+    prepare(sql) {
+      introspectionQueries.push(sql);
+      return {
+        all: async (...values) => {
+          if (/information_schema\.TABLES/.test(sql)) return schemaTableRows;
+          if (/information_schema\.COLUMNS/.test(sql)) {
+            return [...(schemaColumns.get(String(values[0])) || [])].map(name => ({ name }));
+          }
+          return [];
+        },
+        get: async () => null,
+        run: async () => {
+          initializedDdl.push(sql);
+          return { changes: 1, lastInsertRowid: 0 };
+        }
+      };
+    }
+  };
+  const initResult = await initializeMysqlSchema(fakeSchemaDatabase, appSchema, 7);
+  assert.equal(initResult.tablesEnsured, mysqlDdl.filter(sql => sql.startsWith('CREATE TABLE')).length);
+  assert.equal(initResult.indexesCreated, mysqlDdl.filter(sql => sql.startsWith('CREATE INDEX')).length + 7);
+  assert.ok(initResult.columnsAdded > 0);
+  assert.ok(initResult.tenantColumnsAdded > 0 && initResult.tenantColumnsAdded <= schemaTableRows.length);
+  assert.equal(initResult.rowsAssigned, schemaTableRows.length);
+  assert.ok(initializedDdl.every(sql => !/AUTOINCREMENT|sqlite_master|PRAGMA|ON CONFLICT|INDEX IF NOT EXISTS/i.test(sql)));
+  assert.ok(introspectionQueries.some(sql => /information_schema\.TABLES/.test(sql)));
+  assert.ok(introspectionQueries.some(sql => /information_schema\.COLUMNS/.test(sql)));
+  assert.ok(introspectionQueries.some(sql => /information_schema\.STATISTICS/.test(sql)));
+  assert.ok(initializedDdl.some(sql => /ADD COLUMN `public_token` VARCHAR\(64\)/.test(sql)));
+  assert.ok(initializedDdl.some(sql => /UPDATE `settings` SET tenant_id=\? WHERE tenant_id IS NULL/.test(sql)));
+
   const runtime = createMysqlRuntime({
     env: baseEnv,
     mysql: { createPool: fakePool }
@@ -160,6 +252,17 @@ async function main() {
   assert.throws(() => database.withTenant({ id: 2 }, async () => database.query('SELECT 1')), /belum dikonfigurasi/);
   await assert.rejects(dbHelpers.logAudit(null, 'LOGIN', 'auth', ''), /scope tenant/);
 
+  const mappedRuntime = createMysqlRuntime({
+    env: { ...baseEnv, MYSQL_TENANT_DATABASES: '{"1":"school_db","2":"school_two_db"}' },
+    mysql: { createPool: fakePool }
+  });
+  const tenantTwoPool = mappedRuntime.schoolPool(2);
+  assert.notStrictEqual(tenantTwoPool, mappedRuntime.schoolPool(1));
+  assert.equal((await mappedRuntime.query(tenantTwoPool, 'SELECT DATABASE() AS database_name'))[0].database_name, 'school_two_db');
+  assert.throws(() => mappedRuntime.schoolPool(3), /belum dikonfigurasi/);
+  assert.throws(() => mappedRuntime.schoolPool(2, 'other_db'), /tidak cocok/);
+  await mappedRuntime.close();
+
   const tenant = await authStore.tenantByCode('ab12');
   assert.deepEqual(tenant, tenantRow);
   assert.deepEqual(await authStore.tenantById(tenant.id), tenantRow);
@@ -191,6 +294,21 @@ async function main() {
   assert.equal(await authStore.getSession(expiredToken), null);
   assert.equal(sessions.has(expiredToken), false);
   assert.equal((await authStore.adminById(1)), null);
+  const login = await authStore.authenticateSchool({
+    schoolCode: tenant.school_code,
+    identity: 'admin',
+    password: 'secret'
+  });
+  assert.equal(login.ok, true);
+  assert.equal(login.user.id, schoolUser.id);
+  assert.equal((await authStore.getSession(login.token)).tenant_id, tenant.id);
+  await authStore.destroySession(login.token);
+  const rejectedLogin = await authStore.authenticateSchool({
+    schoolCode: tenant.school_code,
+    identity: 'admin',
+    password: 'wrong'
+  });
+  assert.deepEqual(rejectedLogin, { ok: false, reason: 'invalid_credentials' });
 
   await database.withTenant({ id: 1 }, async () => {
     assert.equal(await dbHelpers.getSetting('sekolah_nama'), 'saved');
@@ -233,7 +351,7 @@ async function main() {
     .map(c => c.type), ['begin', 'rollback', 'release']);
 
   await runtime.close();
-  assert.equal(calls.filter(c => c.type === 'end').length, 2);
+  assert.equal(calls.filter(c => c.type === 'end').length, 4);
   console.log('MySQL runtime foundation checks passed');
 }
 

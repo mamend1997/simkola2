@@ -87,42 +87,40 @@ ${ui.themeCss(tema)}
     }));
   });
 
-  post('/login', (req, res) => {
+  post('/login', async (req, res) => {
     const base = req.BASE;
     const kode = String(req.body.kode || '').trim().toUpperCase();
     const ident = String(req.body.email || '').trim();
     const password = String(req.body.password || '');
     const fail = msg => res.redirect(base + '/login?err=' + encodeURIComponent(msg) + (kode ? '&kode=' + encodeURIComponent(kode) : ''));
     const identity = 'school:' + ident.toLowerCase();
-    if (saas.authIsLimited(identity)) return fail('Terlalu banyak percobaan masuk. Silakan coba kembali dalam 15 menit.');
+    if (await saas.authIsLimited(identity)) return fail('Terlalu banyak percobaan masuk. Silakan coba kembali dalam 15 menit.');
     // Kompatibilitas: tautan/ bookmark lama tanpa kode sekolah tetap dilayani
     // oleh sekolah pertama (SK01). Bila kode diisi, isolasi tetap ketat per sekolah.
-    const tenant = kode ? saas.tenantByCode(kode) : saas.tenantById(1);
+    const tenant = kode ? await saas.tenantByCode(kode) : await saas.tenantById(1);
     if (!tenant) {
-      saas.authRecord(identity, false);
+      await saas.authRecord(identity, false);
       return fail(kode ? ('Kode sekolah "' + kode + '" tidak ditemukan. Periksa kembali kode dari admin sekolah Anda.') : 'Kode sekolah wajib diisi (4 karakter).');
     }
     const conn = dbm.openTenantConn(tenant.id, tenant.db_file);
-    const u = conn.prepare("SELECT * FROM users WHERE lower(email)=lower(?) OR lower(COALESCE(username,''))=lower(?) ORDER BY id LIMIT 1").get(ident, ident);
+    const u = await conn.prepare("SELECT * FROM users WHERE lower(email)=lower(?) OR lower(COALESCE(username,''))=lower(?) ORDER BY id LIMIT 1").get(ident, ident);
     if (!u || !lib.verifyPassword(password, u.password)) {
-      saas.authRecord(identity, false);
+      await saas.authRecord(identity, false);
       return fail('Username atau password salah' + (kode ? ' untuk sekolah ' + kode : '') + '.');
     }
     if (!u.aktif) {
-      saas.authRecord(identity, false);
+      await saas.authRecord(identity, false);
       return fail('Akun Anda dinonaktifkan. Hubungi admin sekolah.');
     }
-    saas.authRecord(identity, true);
+    await saas.authRecord(identity, true);
     // hitung draf pengeluaran baru di database sekolah tersebut
-    const alert = dbm.runAsTenant(tenant, () => {
-      const pendingRow = db.prepare(`SELECT COUNT(*) c FROM transaksi t JOIN bku b ON b.id=t.bku_id
+    const alert = await dbm.runAsTenant(tenant, async () => {
+      const pendingRow = await db.prepare(`SELECT COUNT(*) c FROM transaksi t JOIN bku b ON b.id=t.bku_id
         WHERE t.status='pending' AND ${dbm.bkuTransactionVisibleSql('t', 'b')}`).get();
       return pendingRow ? pendingRow.c : 0;
     });
-    const t = setSession(u.id, tenant.id, alert);
-    dbm.runAsTenant(tenant, () => {
-      dbm.logAudit(u, 'LOGIN', 'auth', `${u.nama} masuk ke aplikasi (${tenant.nama})`);
-    });
+    const t = await setSession(u.id, tenant.id, alert);
+    await dbm.runAsTenant(tenant, () => dbm.logAudit(u, 'LOGIN', 'auth', `${u.nama} masuk ke aplikasi (${tenant.nama})`));
     res.set('Set-Cookie', `${COOKIE}=${t}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 14}${secureCookie(req)}`);
     res.redirect(base + '/');
   });
@@ -551,10 +549,10 @@ ${ui.themeCss(tema)}
       };
       let token = null;
       if (admin && admin.aktif) {
-        try { token = setSession(admin.id, tenant.id, 0, JSON.stringify(kredensial)); } catch (e) { console.error('[daftar] gagal membuat sesi:', e.message); }
+        try { token = await setSession(admin.id, tenant.id, 0, JSON.stringify(kredensial)); } catch (e) { console.error('[daftar] gagal membuat sesi:', e.message); }
       }
       try {
-        dbm.runAsTenant(tenant, () => dbm.logAudit(admin || null, 'DAFTAR', 'auth',
+        await dbm.runAsTenant(tenant, () => dbm.logAudit(admin || null, 'DAFTAR', 'auth',
           `Pendaftaran sekolah ${tenant.nama} (${tenant.school_code}) — admin ${email}`
           + (token ? ' langsung masuk ke dashboard' : ' diarahkan ke halaman kredensial')));
       } catch (e) { }
@@ -633,10 +631,10 @@ ${ui.themeCss(tema)}
     }));
   });
 
-  post('/logout', (req, res) => {
+  post('/logout', async (req, res) => {
     const c = String(req.headers.cookie || '');
     const m = c.match(/simkeu_sid=([^;]+)/);
-    if (m) saas.destroySession(decodeURIComponent(m[1]));
+    if (m) await saas.destroySession(decodeURIComponent(m[1]));
     res.set('Set-Cookie', `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secureCookie(req)}`);
     res.redirect(req.BASE + '/login?ok=' + encodeURIComponent('Anda telah keluar dari aplikasi.'));
   });

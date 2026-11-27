@@ -191,45 +191,46 @@ function permissionMatrix() {
 }
 
 /* ---------------- sesi login (control plane, multi-tenant) ---------------- */
-function setSession(userId, tenantId, alertPending, welcome) {
-  const t = saas.createSession({ userId, tenantId, kind: 'tenant', alertPending: alertPending || 0, welcome });
-  dbm.openTenantConn(tenantId, (saas.tenantById(tenantId) || {}).db_file)
+async function setSession(userId, tenantId, alertPending, welcome) {
+  const tenant = await saas.tenantById(tenantId);
+  const t = await saas.createSession({ userId, tenantId, kind: 'tenant', alertPending: alertPending || 0, welcome });
+  await dbm.openTenantConn(tenantId, (tenant || {}).db_file)
     .prepare('UPDATE users SET last_login=? WHERE id=?').run(lib.nowStamp(), userId);
   return t;
 }
 
 /** sesi dari cookie: { row, tenant } untuk sekolah, { row } untuk super admin, atau null */
-function readSession(req) {
+async function readSession(req) {
   const c = parseCookies(req.headers.cookie);
-  const row = saas.getSession(c[COOKIE]);
+  const row = await saas.getSession(c[COOKIE]);
   if (!row) return null;
   if (row.kind === 'saas') return { row };
-  const tenant = saas.tenantById(row.tenant_id);
+  const tenant = await saas.tenantById(row.tenant_id);
   if (!tenant) return null;
   return { row, tenant };
 }
 
 /** muat akun sekolah dari database tenant (dipanggil DI DALAM konteks tenant) */
-function loadTenantUser(session) {
-  const u = dbm.db.prepare('SELECT id,nama,email,role,aktif,jabatan,foto,username FROM users WHERE id=?').get(session.user_id);
+async function loadTenantUser(session) {
+  const u = await dbm.db.prepare('SELECT id,nama,email,role,aktif,jabatan,foto,username FROM users WHERE id=?').get(session.user_id);
   return u && u.aktif ? u : null;
 }
 
 /** tahun pelajaran aktif untuk sesi ini (dropdown header) + query ?ta= */
-function resolveTa(req) {
+async function resolveTa(req) {
   const s = req.sessionRow;
   let taId = s && s.ta_id ? Number(s.ta_id) : null;
   const qta = Number((req.query && req.query.get) ? (req.query.get('ta') || 0) : 0);
-  if (qta && dbm.tahunById(qta)) {
+  if (qta && await dbm.tahunById(qta)) {
     taId = qta;
-    try { saas.updateSession(s.token, { ta_id: qta }); } catch (e) { }
+    try { await saas.updateSession(s.token, { ta_id: qta }); } catch (e) { }
   }
   if (!taId) {
-    taId = dbm.taAutoId();
-    if (taId && s) { try { saas.updateSession(s.token, { ta_id: taId }); } catch (e) { } }
+    taId = await dbm.taAutoId();
+    if (taId && s) { try { await saas.updateSession(s.token, { ta_id: taId }); } catch (e) { } }
   }
   req.taId = taId;
-  req.TA = dbm.tahunById(taId) || dbm.activeTahun();
+  req.TA = await dbm.tahunById(taId) || await dbm.activeTahun();
 }
 
 /* ---------------- upload berkas (terisolasi per sekolah) ---------------- */
@@ -409,13 +410,13 @@ async function faviconResponse(pathname) {
 }
 
 /* ---------------- tahun ajaran aktif (dropdown header) ---------------- */
-post('/ta/pilih', (req, res) => {
+post('/ta/pilih', async (req, res) => {
   if (!req.user) return res.redirect(req.BASE + '/login');
   const id = Number(req.body.ta || 0);
-  const ta = id ? dbm.tahunById(id) : null;
+  const ta = id ? await dbm.tahunById(id) : null;
   const backDemo = req.user && req.user.role === 'demo';
   if (req.sessionRow && !backDemo) {
-    try { saas.updateSession(req.sessionRow.token, { ta_id: ta ? ta.id : null }); } catch (e) { }
+    try { await saas.updateSession(req.sessionRow.token, { ta_id: ta ? ta.id : null }); } catch (e) { }
   }
   const backRaw = String(req.body.back || '');
   const back = /^\/[A-Za-z0-9\-._~!$&'()*+,;=:@%/?]*$/.test(backRaw) && !backRaw.startsWith('//') ? backRaw : '/';
@@ -838,7 +839,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   const R = makeRes(res);
-  const session = readSession(req);
+  const session = await readSession(req);
   const isSuperPath = pathname0 === '/super-admin' || pathname0.startsWith('/super-admin/');
 
   // ---- penentuan tenant dari HOST (custom domain) ----
@@ -1003,11 +1004,11 @@ const server = http.createServer(async (req, res) => {
   if (isSuperPath) {
     try {
       const cookies = parseCookies(req.headers.cookie);
-      const saasRow = saas.getSession(cookies.simkeu_saas);
-      const setupRow = saas.getSession(cookies.simkeu_mfa);
+      const saasRow = await saas.getSession(cookies.simkeu_saas);
+      const setupRow = await saas.getSession(cookies.simkeu_mfa);
       req.saasSession = saasRow && saasRow.kind === 'saas' ? saasRow : null;
       req.mfaSession = setupRow && setupRow.kind === 'saas_mfa_setup' ? setupRow : null;
-      req.saasUser = req.saasSession ? saas.adminById(req.saasSession.user_id) : null;
+      req.saasUser = req.saasSession ? await saas.adminById(req.saasSession.user_id) : null;
       req.body = {};
       if (['POST', 'PUT', 'PATCH'].includes(req.method)) req.body = await readBody(req);
       if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)
@@ -1215,18 +1216,18 @@ const server = http.createServer(async (req, res) => {
         try {
           // ---- keamanan sesi: sesi harus benar-benar milik sekolah ini ----
           if (Number(session.row.tenant_id) !== Number(tenant.id)) {
-            saas.destroySession(session.row.token);
+            await saas.destroySession(session.row.token);
             R.set('Set-Cookie', `${COOKIE}=; Path=/; Max-Age=0`);
             return R.redirect(base + '/login?err=' + encodeURIComponent('Sesi tidak valid untuk sekolah ini. Silakan masuk kembali.'));
           }
-          const u = loadTenantUser(session.row);
+          const u = await loadTenantUser(session.row);
           if (!u) {
-            saas.destroySession(session.row.token);
+            await saas.destroySession(session.row.token);
             R.set('Set-Cookie', `${COOKIE}=; Path=/; Max-Age=0`);
             return R.redirect(base + '/login?err=' + encodeURIComponent('Akun Anda tidak aktif. Hubungi admin sekolah.'));
           }
           if (u.tenant_id !== undefined && u.tenant_id !== null && Number(u.tenant_id) !== Number(tenant.id)) {
-            saas.destroySession(session.row.token);
+            await saas.destroySession(session.row.token);
             return R.redirect(base + '/login?err=' + encodeURIComponent('Akun tidak terikat pada sekolah ini.'));
           }
           req.user = u;
@@ -1285,7 +1286,7 @@ const server = http.createServer(async (req, res) => {
               req.TA = taDemo || null;
               req.taId = taDemo ? taDemo.id : null;
             } else {
-              resolveTa(req);
+              await resolveTa(req);
             }
             await runRoute(pathname);
           };

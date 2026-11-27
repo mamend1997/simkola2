@@ -11,13 +11,35 @@ function databaseName(value, label) {
 }
 
 function readConfig(env = process.env) {
+  const tenantDatabase = databaseName(env.MYSQL_TENANT_DB, 'Nama database sekolah');
+  const controlDatabase = databaseName(env.MYSQL_CONTROL_DB, 'Nama database control plane');
+  let tenantDatabases = {};
+  const tenantMapRaw = String(env.MYSQL_TENANT_DATABASES || '').trim();
+  if (tenantMapRaw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(tenantMapRaw);
+    } catch {
+      throw new Error('MYSQL_TENANT_DATABASES harus berupa JSON object yang valid.');
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('MYSQL_TENANT_DATABASES harus berupa JSON object berisi ID tenant dan nama database.');
+    }
+    tenantDatabases = Object.fromEntries(Object.entries(parsed).map(([id, name]) => {
+      if (!/^[1-9]\d*$/.test(id)) throw new Error('ID tenant di MYSQL_TENANT_DATABASES harus bilangan bulat positif.');
+      const dbName = databaseName(name, `Database tenant ${id}`);
+      if (dbName === controlDatabase) throw new Error(`Database tenant ${id} tidak boleh sama dengan database control plane.`);
+      return [id, dbName];
+    }));
+  }
   const config = {
     host: String(env.MYSQL_HOST || '').trim(),
     port: Number(env.MYSQL_PORT || 3306),
     user: String(env.MYSQL_USER || '').trim(),
     password: String(env.MYSQL_PASSWORD || ''),
-    tenantDatabase: databaseName(env.MYSQL_TENANT_DB, 'Nama database sekolah'),
-    controlDatabase: databaseName(env.MYSQL_CONTROL_DB, 'Nama database control plane'),
+    tenantDatabase,
+    tenantDatabases,
+    controlDatabase,
     connectionLimit: Number(env.MYSQL_CONNECTION_LIMIT || 10)
   };
   if (!config.host || !config.user || !config.password) {
@@ -29,7 +51,7 @@ function readConfig(env = process.env) {
   if (!Number.isInteger(config.connectionLimit) || config.connectionLimit < 1 || config.connectionLimit > 100) {
     throw new Error('MYSQL_CONNECTION_LIMIT harus bilangan bulat antara 1 dan 100.');
   }
-  if (config.tenantDatabase === config.controlDatabase) {
+  if ([config.tenantDatabase, ...Object.values(config.tenantDatabases)].includes(config.controlDatabase)) {
     throw new Error('Database sekolah dan control plane harus berbeda.');
   }
   return config;
@@ -67,9 +89,14 @@ function createMysqlRuntime({ env = process.env, mysql = mysqlDefault } = {}) {
   function schoolPool(tenantId = 1, mysqlDatabase) {
     const id = Number(tenantId);
     if (!Number.isInteger(id) || id < 1) throw new Error('ID sekolah MySQL tidak valid.');
-    if (mysqlDatabase) return poolFor(mysqlDatabase);
-    if (id !== 1) throw new Error(`Database MySQL untuk sekolah ${id} belum dikonfigurasi.`);
-    return poolFor(config.tenantDatabase);
+    const mappedDatabase = config.tenantDatabases[String(id)];
+    const database = mysqlDatabase || mappedDatabase || (id === 1 ? config.tenantDatabase : '');
+    if (!database) throw new Error(`Database MySQL untuk sekolah ${id} belum dikonfigurasi.`);
+    if (database === config.controlDatabase) throw new Error(`Database sekolah ${id} tidak boleh memakai database control plane.`);
+    if (mappedDatabase && mysqlDatabase && mappedDatabase !== mysqlDatabase) {
+      throw new Error(`Database MySQL tenant ${id} tidak cocok dengan pemetaan yang dikonfigurasi.`);
+    }
+    return poolFor(database);
   }
 
   async function query(pool, sql, values = []) {
